@@ -1,0 +1,14 @@
+{
+  "volume_sfx": 1.0,
+  "volume_music": 1.0,
+  "volume_mic": 1.0,
+  "mic_active": true,
+  "loop_sfx": true,
+  "loop_music": true,
+  "mic_input_device": "Microsoft Sound Mapper - Input",
+  "output_device": "Output (NVIDIA High Definition Audio)",
+  "default_output_device": "Output (NVIDIA High Definition Audio)",
+  "max_channels": 8,
+  "sample_rate": 44100,
+  "buffer_size": 1024
+}
