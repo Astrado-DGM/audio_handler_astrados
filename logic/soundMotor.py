@@ -3,7 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pygame
 import sounddevice as sd
 
@@ -18,6 +17,7 @@ class singleSoundHandler:
         self.channel = None
         self.loop = False
         self.volume = 1.0
+        self.paused = False
         self.max_channels = max(1, min(8, int(max_channels)))
         self._ensure_mixer(output_device)
         self.apply_config(config or {})
@@ -92,10 +92,28 @@ class singleSoundHandler:
         self.channel = self.sound.play(loops=-1 if loop_enabled else 0)
         if self.channel is not None:
             self.channel.set_volume(self.volume)
+        self.paused = False
 
     def stop(self) -> None:
         if self.channel is not None:
             self.channel.stop()
+        self.paused = False
+
+    def pause(self) -> None:
+        if self.channel is not None and self.channel.get_busy():
+            self.channel.pause()
+            self.paused = True
+
+    def resume(self) -> None:
+        if self.channel is not None and self.paused:
+            self.channel.unpause()
+            self.paused = False
+
+    def toggle_pause(self) -> None:
+        if self.paused:
+            self.resume()
+        else:
+            self.pause()
 
     def set_volume(self, volume: float) -> None:
         self.volume = self._clamp_volume(volume)
@@ -107,6 +125,9 @@ class singleSoundHandler:
     def is_playing(self) -> bool:
         return self.channel is not None and self.channel.get_busy()
 
+    def is_paused(self) -> bool:
+        return self.paused
+
     def set_loop(self, loop: bool) -> None:
         self.loop = bool(loop)
         if self.channel is not None and self.channel.get_busy():
@@ -115,7 +136,7 @@ class singleSoundHandler:
 
     def update(self, current_config: dict[str, Any]) -> None:
         self.apply_config(current_config)
-        if self.loop and self.sound is not None and (self.channel is None or not self.channel.get_busy()):
+        if self.loop and self.sound is not None and (self.channel is None or not self.channel.get_busy()) and not self.paused:
             self.channel = self.sound.play(loops=-1)
             if self.channel is not None:
                 self.channel.set_volume(self.volume)
@@ -169,9 +190,9 @@ class soundMotor:
         if indata.size == 0:
             return
 
-        data = np.asarray(indata, dtype=np.float32) * float(self.mic_volume)
-        if data.ndim == 1:
-            data = data[:, np.newaxis]
+        data = indata * float(self.mic_volume)
+        if getattr(data, "ndim", 2) == 1:
+            data = data[:, None]
 
         input_channels = data.shape[1]
         output_channels = outdata.shape[1]
@@ -302,8 +323,26 @@ class soundMotor:
     def stop_music(self) -> None:
         self.music.stop()
 
+    def pause_music(self) -> None:
+        self.music.pause()
+
+    def resume_music(self) -> None:
+        self.music.resume()
+
+    def toggle_music_pause(self) -> None:
+        self.music.toggle_pause()
+
     def stop_sfx(self) -> None:
         self.sfx.stop()
+
+    def pause_sfx(self) -> None:
+        self.sfx.pause()
+
+    def resume_sfx(self) -> None:
+        self.sfx.resume()
+
+    def toggle_sfx_pause(self) -> None:
+        self.sfx.toggle_pause()
 
     def get_available_output_devices(self) -> list[str]:
         devices = sd.query_devices()

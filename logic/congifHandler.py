@@ -28,6 +28,17 @@ class configHandler:
             "max_channels": 8,
             "sample_rate": 44100,
             "buffer_size": 1024,
+            "hotkeys": {
+                "refresh_library": "Ctrl+R",
+                "toggle_mic": "Ctrl+M",
+                "play_music": "Ctrl+Shift+M",
+                "stop_music": "Ctrl+Alt+M",
+                "pause_music": "Ctrl+P",
+                "play_sfx": "Ctrl+E",
+                "stop_sfx": "Ctrl+Alt+E",
+                "pause_sfx": "Ctrl+Shift+E",
+                "save_settings": "Ctrl+S",
+            },
         }
 
     def _clamp_float(self, value: Any) -> float:
@@ -40,6 +51,11 @@ class configHandler:
         merged = self.load_default_config()
         if new_config:
             merged.update(new_config)
+
+        hotkeys = dict(self.load_default_config()["hotkeys"])
+        if isinstance(merged.get("hotkeys"), dict):
+            hotkeys.update(merged["hotkeys"])
+        merged["hotkeys"] = hotkeys
 
         merged["volume_sfx"] = self._clamp_float(merged.get("volume_sfx", 1.0))
         merged["volume_music"] = self._clamp_float(merged.get("volume_music", 1.0))
@@ -108,6 +124,15 @@ class configHandler:
 
     def default_output_device(self):
         return self.config.get("default_output_device")
+
+    def hotkeys(self) -> dict[str, str]:
+        defaults = self.load_default_config()["hotkeys"]
+        current = self.config.get("hotkeys", {})
+        if not isinstance(current, dict):
+            current = {}
+        merged = dict(defaults)
+        merged.update(current)
+        return merged
 
     def max_channels(self) -> int:
         return int(self.config.get("max_channels", 8))
