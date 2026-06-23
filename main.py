@@ -115,6 +115,16 @@ def scan_local_assets(folder: Path, category: str) -> list[AudioAsset]:
     return assets
 
 
+def format_device_label(index: int, device: dict[str, Any], hostapi_name: str | None = None) -> str:
+    name = str(device.get("name", "Unknown device"))
+    input_channels = int(device.get("max_input_channels", 0) or 0)
+    output_channels = int(device.get("max_output_channels", 0) or 0)
+    details = [f"[{index}]", name, f"(in:{input_channels} out:{output_channels})"]
+    if hostapi_name:
+        details.append(f"({hostapi_name})")
+    return " ".join(details)
+
+
 def parse_hotkey_spec(spec: str) -> tuple[int, int] | None:
     cleaned = spec.strip().replace("-", "+")
     if not cleaned:
@@ -223,13 +233,13 @@ def hotkey_spec_from_event(event: tk.Event) -> str | None:
 
 
 class HotkeyCaptureDialog(tk.Toplevel):
-    def __init__(self, parent: tk.Widget, label: str, current_value: str) -> None:
+    def __init__(self, parent: tk.Misc, label: str, current_value: str) -> None:
         super().__init__(parent)
         self.result: str | None = None
         self.configure(bg="#111318")
         self.title(f"Capturar {label}")
         self.resizable(False, False)
-        self.transient(parent)
+        self.transient(parent.winfo_toplevel())
         self.grab_set()
 
         self.status_var = tk.StringVar(value=f"Actual: {format_hotkey_spec(current_value)}")
@@ -341,15 +351,18 @@ class GlobalHotkeyManager:
 
 
 class AudioLibraryPanel(tk.Frame):
-    def __init__(self, parent: tk.Widget, title: str, description: str) -> None:
+    def __init__(self, parent: tk.Widget, title: str, description: str, show_progress: bool = False) -> None:
         super().__init__(parent, bg="#171a20")
         self.title = title
         self.description = description
+        self.show_progress = show_progress
         self.assets: list[AudioAsset] = []
         self.play_handler: Callable[[AudioAsset], None] | None = None
         self.pause_handler: Callable[[], None] | None = None
         self.stop_handler: Callable[[], None] | None = None
+        self.seek_handler: Callable[[AudioAsset, float], None] | None = None
         self.search_var = tk.StringVar(value="")
+        self._row_state: dict[Path, dict[str, Any]] = {}
 
         self._build()
 
@@ -402,9 +415,47 @@ class AudioLibraryPanel(tk.Frame):
         self.pause_handler = pause_handler
         self.stop_handler = stop_handler
 
+    def set_seek_handler(self, handler: Callable[[AudioAsset, float], None] | None) -> None:
+        self.seek_handler = handler
+
+    def update_progress(
+        self,
+        asset: AudioAsset | None,
+        current_seconds: float,
+        duration_seconds: float,
+        is_playing: bool,
+        is_paused: bool,
+    ) -> None:
+        if not self.show_progress:
+            return
+
+        active_path = asset.path if asset is not None else None
+        for path, state in self._row_state.items():
+            progress_var = state.get("progress_var")
+            time_var = state.get("time_var")
+            scale = state.get("scale")
+            if progress_var is None or time_var is None or scale is None:
+                continue
+
+            if active_path is None or path != active_path or duration_seconds <= 0:
+                progress_var.set(0.0)
+                time_var.set("0:00 / 0:00")
+                continue
+
+            percentage = max(0.0, min(100.0, (current_seconds / duration_seconds) * 100.0))
+            progress_var.set(percentage)
+            time_var.set(f"{self._format_time(current_seconds)} / {self._format_time(duration_seconds)}")
+            scale.state(["!disabled"] if is_playing or is_paused else ["disabled"])
+
+    def _format_time(self, seconds: float) -> str:
+        total_seconds = max(0, int(seconds))
+        minutes, remaining_seconds = divmod(total_seconds, 60)
+        return f"{minutes}:{remaining_seconds:02d}"
+
     def _render(self) -> None:
         for child in self.content.winfo_children():
             child.destroy()
+        self._row_state.clear()
 
         filter_text = self.search_var.get().strip().lower()
         filtered_assets = [
@@ -419,19 +470,42 @@ class AudioLibraryPanel(tk.Frame):
         for asset in filtered_assets:
             row = tk.Frame(self.content, bg="#111318")
             row.pack(fill="x", pady=6)
-            row.columnconfigure(0, weight=1)
+            row.columnconfigure(0, weight=0)
+            row.columnconfigure(1, weight=1)
+            row.columnconfigure(2, weight=0)
 
             text_frame = tk.Frame(row, bg="#111318")
             text_frame.grid(row=0, column=0, sticky="ew", padx=(12, 8), pady=10)
             tk.Label(text_frame, text=asset.path.name, bg="#111318", fg="#f4f7fb", anchor="w").pack(anchor="w")
             tk.Label(text_frame, text=asset.path.parent.name, bg="#111318", fg="#94a3b8", anchor="w", font=("Segoe UI", 9)).pack(anchor="w")
 
+            progress_frame = tk.Frame(row, bg="#111318")
+            progress_frame.grid(row=0, column=1, sticky="ew", padx=8, pady=10)
+            progress_frame.columnconfigure(0, weight=1)
+
+            progress_var = tk.DoubleVar(value=0.0)
+            time_var = tk.StringVar(value="0:00 / 0:00")
+            scale: ttk.Scale | None = None
+            if self.show_progress:
+                scale = ttk.Scale(progress_frame, from_=0, to=100, orient="horizontal", variable=progress_var)
+                scale.grid(row=0, column=0, sticky="ew")
+                scale.bind("<ButtonRelease-1>", lambda event, current_asset=asset, current_var=progress_var: self._seek(current_asset, float(current_var.get())))
+                tk.Label(progress_frame, textvariable=time_var, bg="#111318", fg="#94a3b8", font=("Segoe UI", 8)).grid(row=1, column=0, sticky="w", pady=(4, 0))
+            else:
+                progress_frame.grid_remove()
+
             action_frame = tk.Frame(row, bg="#111318")
-            action_frame.grid(row=0, column=1, sticky="e", padx=(8, 12), pady=10)
+            action_frame.grid(row=0, column=2, sticky="e", padx=(8, 12), pady=10)
 
             ttk.Button(action_frame, text="Play", command=lambda current_asset=asset: self._play(current_asset), width=8).pack(side="left", padx=(0, 6))
             ttk.Button(action_frame, text="Pause", command=self._pause, width=8).pack(side="left", padx=(0, 6))
             ttk.Button(action_frame, text="Stop", command=self._stop, width=8).pack(side="left")
+
+            self._row_state[asset.path] = {
+                "progress_var": progress_var,
+                "time_var": time_var,
+                "scale": scale,
+            }
 
     def _play(self, asset: AudioAsset) -> None:
         if self.play_handler is not None:
@@ -444,6 +518,10 @@ class AudioLibraryPanel(tk.Frame):
     def _stop(self) -> None:
         if self.stop_handler is not None:
             self.stop_handler()
+
+    def _seek(self, asset: AudioAsset, percentage: float) -> None:
+        if self.seek_handler is not None:
+            self.seek_handler(asset, max(0.0, min(100.0, percentage)))
 
 
 class AudioHandlerApp:
@@ -473,10 +551,12 @@ class AudioHandlerApp:
             "mic_active": tk.BooleanVar(value=self.config_manager.mic_active()),
             "loop_music": tk.BooleanVar(value=self.config_manager.loop_music()),
             "loop_sfx": tk.BooleanVar(value=self.config_manager.loop_sfx()),
+            "monitor_audio": tk.BooleanVar(value=bool(self.config_manager.as_dict().get("monitor_audio", False))),
         }
         self.device_vars = {
             "output_device": tk.StringVar(value=self.config_manager.output_device() or self.config_manager.default_output_device() or ""),
             "mic_input_device": tk.StringVar(value=self.config_manager.mic_input_device() or ""),
+            "monitor_output_device": tk.StringVar(value=self.config_manager.as_dict().get("monitor_output_device") or self.config_manager.output_device() or self.config_manager.default_output_device() or ""),
         }
         self.hotkey_vars = {
             action: tk.StringVar(value=self.config_manager.hotkeys().get(action, default_hotkeys()[action]))
@@ -490,6 +570,7 @@ class AudioHandlerApp:
         self.apply_settings(persist=False)
         self._register_hotkeys()
         self.root.after(100, self._poll_hotkey_events)
+        self.root.after(150, self._poll_playback_state)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self) -> None:
@@ -521,7 +602,7 @@ class AudioHandlerApp:
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill="both", expand=True, padx=16, pady=10)
 
-        self.music_panel = AudioLibraryPanel(notebook, "Musica", "Pistas locales que suenan en loop de fondo")
+        self.music_panel = AudioLibraryPanel(notebook, "Musica", "Pistas locales que suenan en loop de fondo", show_progress=True)
         self.sfx_panel = AudioLibraryPanel(notebook, "Efectos", "Archivos disparados por evento sin silenciar otras fuentes")
         self.hotkeys_tab = self._build_hotkeys_tab(notebook)
         self.config_tab = self._build_config_tab(notebook)
@@ -534,6 +615,7 @@ class AudioHandlerApp:
         notebook.add(self.engine_tab, text="Motor")
 
         self.music_panel.set_action_handlers(self.play_music_asset, self.toggle_music_pause, self.stop_music)
+        self.music_panel.set_seek_handler(self.seek_music_asset)
         self.sfx_panel.set_action_handlers(self.play_sfx_asset, self.toggle_sfx_pause, self.stop_sfx)
 
         status_bar = tk.Label(self.root, textvariable=self.status_text, anchor="w", bg="#1a1d24", fg="#dbe2ee", padx=12, pady=8)
@@ -588,6 +670,7 @@ class AudioHandlerApp:
         tk.Checkbutton(switch_row, text="Microfono activo", variable=self.bool_vars["mic_active"], bg="#111318", fg="#e5e7eb", selectcolor="#111318", activebackground="#111318", activeforeground="#e5e7eb").pack(anchor="w")
         tk.Checkbutton(switch_row, text="Loop musica", variable=self.bool_vars["loop_music"], bg="#111318", fg="#e5e7eb", selectcolor="#111318", activebackground="#111318", activeforeground="#e5e7eb").pack(anchor="w")
         tk.Checkbutton(switch_row, text="Loop SFX", variable=self.bool_vars["loop_sfx"], bg="#111318", fg="#e5e7eb", selectcolor="#111318", activebackground="#111318", activeforeground="#e5e7eb").pack(anchor="w")
+        tk.Checkbutton(switch_row, text="Escucha local duplicada", variable=self.bool_vars["monitor_audio"], bg="#111318", fg="#e5e7eb", selectcolor="#111318", activebackground="#111318", activeforeground="#e5e7eb").pack(anchor="w")
 
         device_frame = tk.Frame(controls, bg="#111318")
         device_frame.grid(row=4, column=0, columnspan=2, sticky="ew", padx=12, pady=(10, 4))
@@ -602,8 +685,12 @@ class AudioHandlerApp:
         self.mic_device_combo = ttk.Combobox(device_frame, textvariable=self.device_vars["mic_input_device"], state="readonly")
         self.mic_device_combo.grid(row=1, column=1, sticky="ew", pady=6)
 
-        ttk.Button(device_frame, text="Aplicar ajustes", command=self.apply_settings).grid(row=0, column=2, rowspan=2, padx=16, sticky="ns")
-        ttk.Button(device_frame, text="Guardar ajustes", command=self.save_settings).grid(row=0, column=3, rowspan=2, sticky="ns")
+        tk.Label(device_frame, text="Salida monitor", bg="#111318", fg="#dbe2ee").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=6)
+        self.monitor_device_combo = ttk.Combobox(device_frame, textvariable=self.device_vars["monitor_output_device"], state="readonly")
+        self.monitor_device_combo.grid(row=2, column=1, sticky="ew", pady=6)
+
+        ttk.Button(device_frame, text="Aplicar ajustes", command=self.apply_settings).grid(row=0, column=2, rowspan=3, padx=16, sticky="ns")
+        ttk.Button(device_frame, text="Guardar ajustes", command=self.save_settings).grid(row=0, column=3, rowspan=3, sticky="ns")
 
         info = tk.Label(
             controls,
@@ -669,22 +756,60 @@ class AudioHandlerApp:
     def _load_device_lists(self) -> None:
         try:
             devices = sd.query_devices()
+            hostapis = sd.query_hostapis()
         except Exception as error:
             self.output_device_combo["values"] = []
             self.mic_device_combo["values"] = []
+            self.monitor_device_combo["values"] = []
             self._set_status(f"No se pudo leer la lista de dispositivos de audio: {error}")
             return
 
-        output_devices = [device["name"] for device in devices if device.get("max_output_channels", 0) > 0]
-        input_devices = [device["name"] for device in devices if device.get("max_input_channels", 0) > 0]
+        all_devices = [
+            format_device_label(index, device, str(hostapis[int(device.get("hostapi", 0))].get("name", "")) if hostapis else None)
+            for index, device in enumerate(devices)
+        ]
+        input_devices = [
+            format_device_label(index, device, str(hostapis[int(device.get("hostapi", 0))].get("name", "")) if hostapis else None)
+            for index, device in enumerate(devices)
+            if device.get("max_input_channels", 0) > 0
+        ]
+        output_devices = [
+            format_device_label(index, device, str(hostapis[int(device.get("hostapi", 0))].get("name", "")) if hostapis else None)
+            for index, device in enumerate(devices)
+            if device.get("max_output_channels", 0) > 0
+        ]
 
-        self.output_device_combo["values"] = output_devices
+        self.output_device_combo["values"] = all_devices
         self.mic_device_combo["values"] = input_devices
+        self.monitor_device_combo["values"] = output_devices
 
-        if not self.device_vars["output_device"].get() and output_devices:
-            self.device_vars["output_device"].set(output_devices[0])
-        if not self.device_vars["mic_input_device"].get() and input_devices:
+        def pick_label(current_value: str, choices: list[str]) -> str | None:
+            if not current_value:
+                return None
+            if current_value in choices:
+                return current_value
+            for choice in choices:
+                if current_value in choice:
+                    return choice
+            return None
+
+        current_output = pick_label(self.device_vars["output_device"].get(), all_devices)
+        if current_output is not None:
+            self.device_vars["output_device"].set(current_output)
+        elif all_devices:
+            self.device_vars["output_device"].set(all_devices[0])
+
+        current_input = pick_label(self.device_vars["mic_input_device"].get(), input_devices)
+        if current_input is not None:
+            self.device_vars["mic_input_device"].set(current_input)
+        elif input_devices:
             self.device_vars["mic_input_device"].set(input_devices[0])
+
+        current_monitor = pick_label(self.device_vars["monitor_output_device"].get(), output_devices)
+        if current_monitor is not None:
+            self.device_vars["monitor_output_device"].set(current_monitor)
+        elif output_devices:
+            self.device_vars["monitor_output_device"].set(self.device_vars["output_device"].get() or output_devices[0])
 
     def _collect_settings(self) -> dict[str, Any]:
         return {
@@ -694,9 +819,11 @@ class AudioHandlerApp:
             "mic_active": bool(self.bool_vars["mic_active"].get()),
             "loop_music": bool(self.bool_vars["loop_music"].get()),
             "loop_sfx": bool(self.bool_vars["loop_sfx"].get()),
+            "monitor_audio": bool(self.bool_vars["monitor_audio"].get()),
             "output_device": self.device_vars["output_device"].get() or None,
             "default_output_device": self.device_vars["output_device"].get() or None,
             "mic_input_device": self.device_vars["mic_input_device"].get() or None,
+            "monitor_output_device": self.device_vars["monitor_output_device"].get() or None,
             "hotkeys": self._collect_hotkeys(),
         }
 
@@ -717,6 +844,7 @@ class AudioHandlerApp:
         self.config_manager.updateConfig(settings)
         self.audio_motor.apply_config(self.config_manager.as_dict())
         self._register_hotkeys()
+        self._sync_music_progress()
         if persist:
             self.config_manager.saveConfig()
             self._set_status("Ajustes guardados y aplicados.")
@@ -749,6 +877,40 @@ class AudioHandlerApp:
         for action in self.hotkey_manager.poll():
             self._handle_hotkey_action(action)
         self.root.after(100, self._poll_hotkey_events)
+
+    def _poll_playback_state(self) -> None:
+        self._sync_music_progress()
+        self.root.after(150, self._poll_playback_state)
+
+    def _sync_music_progress(self) -> None:
+        state = self.audio_motor.get_music_state()
+        source = state.get("source")
+        asset = None
+        if source is not None:
+            source_path = Path(source)
+            for current_asset in self.music_assets:
+                if current_asset.path == source_path:
+                    asset = current_asset
+                    break
+
+        self.music_panel.update_progress(
+            asset,
+            float(state.get("position_seconds", 0.0)),
+            float(state.get("duration_seconds", 0.0)),
+            bool(state.get("is_playing", False)),
+            bool(state.get("is_paused", False)),
+        )
+
+    def seek_music_asset(self, asset: AudioAsset, percentage: float) -> None:
+        duration = float(self.audio_motor.get_music_state().get("duration_seconds", 0.0))
+        if duration <= 0:
+            self.play_music_asset(asset)
+            return
+
+        target_seconds = max(0.0, min(duration, (percentage / 100.0) * duration))
+        self.active_music_asset = asset
+        self.play_music_asset(asset, start_seconds=target_seconds)
+        self._set_status(f"Buscando en musica: {asset.path.name} al {int(percentage)}%")
 
     def _handle_hotkey_action(self, action: str) -> None:
         handlers: dict[str, Callable[[], None]] = {
@@ -799,9 +961,9 @@ class AudioHandlerApp:
     def _first_asset(self, assets: list[AudioAsset]) -> AudioAsset | None:
         return assets[0] if assets else None
 
-    def play_music_asset(self, asset: AudioAsset) -> None:
+    def play_music_asset(self, asset: AudioAsset, start_seconds: float = 0.0) -> None:
         self.active_music_asset = asset
-        self.audio_motor.play_music(asset.path)
+        self.audio_motor.play_music(asset.path, start_seconds=start_seconds)
         self._set_status(f"Reproduciendo musica: {asset.path.name}")
 
     def play_sfx_asset(self, asset: AudioAsset) -> None:

@@ -22,6 +22,8 @@ class configHandler:
             "mic_active": False,
             "loop_sfx": False,
             "loop_music": True,
+            "monitor_audio": False,
+            "monitor_output_device": None,
             "mic_input_device": None,
             "output_device": None,
             "default_output_device": None,
@@ -63,6 +65,8 @@ class configHandler:
         merged["mic_active"] = bool(merged.get("mic_active", False))
         merged["loop_sfx"] = bool(merged.get("loop_sfx", False))
         merged["loop_music"] = bool(merged.get("loop_music", True))
+        merged["monitor_audio"] = bool(merged.get("monitor_audio", False))
+        merged["monitor_output_device"] = merged.get("monitor_output_device") or None
         merged["mic_input_device"] = merged.get("mic_input_device") or None
         merged["output_device"] = merged.get("output_device") or None
         merged["default_output_device"] = merged.get("default_output_device") or merged["output_device"]
