@@ -1,9 +1,9 @@
-"""Interfaz principal de Audio Handler PV.
+"""Interfaz principal de Astrados Audio Handler.
 
 La app organiza musica, SFX y microfono en una sola salida local y permite:
 - reproducir pistas individuales desde botones Play
 - configurar hotkeys globales editables desde la interfaz
-- persistir configuracion local en data/config
+- persistir configuracion local (data/config, o %LOCALAPPDATA% en la version instalada)
 """
 
 from __future__ import annotations
@@ -11,7 +11,9 @@ from __future__ import annotations
 import ctypes
 import queue
 import re
+import os
 import shutil
+import sys
 import threading
 import webbrowser
 from dataclasses import dataclass
@@ -24,6 +26,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkinter import font as tkfont
 
+from appinfo import APP_NAME, APP_VERSION
 from logic import uiTheme
 from logic.congifHandler import DEFAULT_HOTKEYS, configHandler
 from logic.soundMotor import resolve_device, soundMotor
@@ -37,14 +40,18 @@ from logic.virtualCable import (
 )
 
 
-APP_TITLE = "Audio Handler PV"
+APP_TITLE = APP_NAME
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+FROZEN = bool(getattr(sys, "frozen", False))
+# Instalada (PyInstaller) los recursos van junto al exe y Program Files no es
+# escribible: la musica, los SFX y la config del usuario viven en %LOCALAPPDATA%.
+RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", BASE_DIR))
+DATA_DIR = (Path(os.environ.get("LOCALAPPDATA", Path.home())) / APP_NAME) if FROZEN else BASE_DIR / "data"
 MUSIC_DIR = DATA_DIR / "music"
 SFX_DIR = DATA_DIR / "sfx"
 RECORDINGS_DIR = DATA_DIR / "recordings"
 CONFIG_DIR = DATA_DIR / "config"
-VISUAL_DIR = BASE_DIR / "visual"
+VISUAL_DIR = RESOURCE_DIR / "visual"
 TRACK_EXTENSIONS = {".mp3"}
 
 WM_HOTKEY = 0x0312
@@ -574,7 +581,7 @@ class AudioLibraryPanel(ttk.Frame):
 class AudioHandlerApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title(APP_TITLE)
+        self.root.title(f"{APP_TITLE} v{APP_VERSION}")
         self.root.geometry("1200x820")
         self.root.minsize(1060, 700)
         self.theme = uiTheme.Theme(root, VISUAL_DIR / "ui")
@@ -1413,6 +1420,11 @@ class AudioHandlerApp:
 
 def main() -> None:
     ensure_project_directories()
+    # Sin esto la barra de tareas agrupa la ventana bajo el icono de Python.
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Astrados.AudioHandler")
+    except (AttributeError, OSError):
+        pass
     root = tk.Tk()
     AudioHandlerApp(root)
     root.mainloop()

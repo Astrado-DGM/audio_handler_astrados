@@ -1,4 +1,4 @@
-# Plan de desarrollo - Audio Handler PV
+# Plan de desarrollo - Astrados Audio Handler
 
 ## Objetivo
 Construir un programa local para mezclar microfono, musica en loop y efectos de sonido en una salida unica que otros programas, como Discord, puedan usar como entrada.

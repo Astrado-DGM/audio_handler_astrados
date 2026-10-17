@@ -192,6 +192,10 @@ def build_images(src: Path) -> None:
     logo.alpha_composite(resize(square(speaker), (66, 66)), (15, 15))
     save(logo, "logo")
     save(resize(square(speaker), (32, 32)), "app_icon")
+    # Icono del ejecutable y de los instaladores (ICO real, multi-tamano).
+    resize(square(speaker), (256, 256)).save(
+        PROJECT / "visual" / "app.ico", sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
+    )
 
     # Botones pill (normal / hover / pressed / disabled) a partir de los orbes.
     for name, source in (("blue", blue_orb), ("light", light_orb), ("purple", purple_orb)):
