@@ -1,6 +1,6 @@
 ; Instalador setup.exe de Astrados Audio Handler (Inno Setup 6.3+).
 ; Lo compila tools/build_release.sh, que pasa la version y las rutas:
-;   ISCC /DAppVersion=1.0.0 /DSourceDir=<carpeta PyInstaller> /DOutputDir=<salida> /DIconFile=<app.ico> AstradosAudioHandler.iss
+;   ISCC /DAppVersion=1.0.0 /DSourceDir=<carpeta PyInstaller> /DOutputDir=<salida> /DIconFile=<app.ico> /DCreditsFile=<creditos.txt> AstradosAudioHandler.iss
 ; El AppId no debe cambiar nunca: es lo que permite actualizar sobre una version anterior.
 
 #ifndef AppVersion
@@ -14,6 +14,9 @@
 #endif
 #ifndef IconFile
   #define IconFile "..\visual\app.ico"
+#endif
+#ifndef CreditsFile
+  #error "Falta /DCreditsFile (creditos en texto plano, los genera build_release.sh)"
 #endif
 
 #define AppName "Astrados Audio Handler"
@@ -42,6 +45,8 @@ UninstallDisplayIcon={app}\{#AppExe}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
+; Pagina de creditos (recursos graficos, sonidos CC BY 4.0, licencias) antes de instalar.
+InfoBeforeFile={#CreditsFile}
 
 [Languages]
 Name: "spanish"; MessagesFile: "compiler:Languages\Spanish.isl"

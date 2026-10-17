@@ -6,7 +6,9 @@ Uso (solo al cambiar el tema; la app usa los PNG/WAV ya generados en visual/):
 
 Todo sale de assets existentes: los botones "pill" se arman estirando los orbes
 de vidrio del Frutiger Aero Archive, los iconos son Heroicons rasterizados y los
-sonidos son SOUNDICONS / Helton Yan recortados y normalizados.
+sonidos son notas de "Tranquility" (Helton Yan) recortadas y normalizadas.
+Las imagenes se generan en varias escalas (visual/ui/<porcentaje>/) para que se
+vean nitidas con el escalado de pantalla de Windows.
 """
 
 from __future__ import annotations
@@ -24,6 +26,8 @@ PROJECT = Path(__file__).resolve().parents[1]
 UI_OUT = PROJECT / "visual" / "ui"
 SOUND_OUT = PROJECT / "visual" / "sounds"
 SUPERSAMPLE = 4
+# Escalas de Windows (100 % = 96 DPI). La app elige la mas cercana a la pantalla.
+SCALES = (100, 125, 150, 175, 200)
 
 # Paleta Windows 7 / Frutiger: azul cielo y morado.
 ICON_DARK = "#1e3a6e"
@@ -158,12 +162,23 @@ def gloss(image: Image.Image, strength: float) -> Image.Image:
     return out
 
 
-def save(image: Image.Image, name: str) -> None:
-    image.save(UI_OUT / f"{name}.png", optimize=True)
+def save(image: Image.Image, out_dir: Path, name: str) -> None:
+    image.save(out_dir / f"{name}.png", optimize=True)
 
 
-def build_images(src: Path) -> None:
-    UI_OUT.mkdir(parents=True, exist_ok=True)
+def build_images(src: Path, percent: int) -> None:
+    """Genera todo el set de imagenes para una escala de pantalla (100 = 96 DPI).
+
+    Cada escala se dibuja desde el original en alta resolucion: asi la app nunca
+    estira bitmaps y se ve nitida a 125 %, 150 %, etc.
+    """
+    k = percent / 100
+    out = UI_OUT / str(percent)
+    out.mkdir(parents=True, exist_ok=True)
+
+    def px(value: float) -> int:
+        return max(1, round(value * k))
+
     archive = "Graphic/frutigeraeroarchive"
     blue_orb = load(src, f"{archive}/metro/metro_52.png")
     # El orbe cian se lleva a azul cielo para la paleta azul claro / morado.
@@ -175,80 +190,82 @@ def build_images(src: Path) -> None:
 
     # Cabecera: cielo con nubes, velo morado a la izquierda y brillo de vidrio.
     sky = load(src, f"{archive}/skyboxes/skyboxes_47.png")
-    header = cover(sky, 1920, 112, 0.0)
+    header = cover(sky, px(1920), px(112), 0.0)
     header = gradient_tint(header, (109, 63, 196), 0.62, 0.0)
-    save(gloss(header, 0.22), "header")
+    save(gloss(header, 0.22), out, "header")
 
-    status = cover(load(src, f"{archive}/skyboxes/skyboxes_6.png"), 1920, 30, 0.85)
-    save(gradient_tint(gloss(status, 0.35), (109, 63, 196), 0.10, 0.0), "statusbar")
+    status = cover(load(src, f"{archive}/skyboxes/skyboxes_6.png"), px(1920), px(30), 0.85)
+    save(gradient_tint(gloss(status, 0.35), (109, 63, 196), 0.10, 0.0), out, "statusbar")
 
     bubbles = crop_alpha(load(src, f"{archive}/bubbles/bubbles_10.png"))
-    save(resize(bubbles, (round(bubbles.width * 104 / bubbles.height), 104)), "header_bubbles")
+    save(resize(bubbles, (round(bubbles.width * px(104) / bubbles.height), px(104))), out, "header_bubbles")
 
     glow = crop_alpha(load(src, f"{archive}/flares/flares_19.png"))
     speaker = crop_alpha(load(src, f"{archive}/objects/objects_13.png"))
-    logo = Image.new("RGBA", (96, 96), (0, 0, 0, 0))
-    logo.alpha_composite(resize(square(glow), (96, 96)))
-    logo.alpha_composite(resize(square(speaker), (66, 66)), (15, 15))
-    save(logo, "logo")
-    save(resize(square(speaker), (32, 32)), "app_icon")
-    # Icono del ejecutable y de los instaladores (ICO real, multi-tamano).
-    resize(square(speaker), (256, 256)).save(
-        PROJECT / "visual" / "app.ico", sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
-    )
+    logo = Image.new("RGBA", (px(96), px(96)), (0, 0, 0, 0))
+    logo.alpha_composite(resize(square(glow), (px(96), px(96))))
+    logo.alpha_composite(resize(square(speaker), (px(66), px(66))), (px(15), px(15)))
+    save(logo, out, "logo")
+    save(resize(square(speaker), (px(32), px(32))), out, "app_icon")
+    if percent == 100:
+        # Icono del ejecutable y de los instaladores (ICO real, multi-tamano).
+        resize(square(speaker), (256, 256)).save(
+            PROJECT / "visual" / "app.ico", sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
+        )
 
     # Botones pill (normal / hover / pressed / disabled) a partir de los orbes.
     for name, source in (("blue", blue_orb), ("light", light_orb), ("purple", purple_orb)):
-        base = pill_from_orb(source, 120, 32)
-        save(base, f"pill_{name}")
-        save(brightness(base, 1.12), f"pill_{name}_hover")
-        save(brightness(base, 0.85), f"pill_{name}_pressed")
-        save(disabled(base), f"pill_{name}_disabled")
+        base = pill_from_orb(source, px(120), px(32))
+        save(base, out, f"pill_{name}")
+        save(brightness(base, 1.12), out, f"pill_{name}_hover")
+        save(brightness(base, 0.85), out, f"pill_{name}_pressed")
+        save(disabled(base), out, f"pill_{name}_disabled")
 
-    tab = pill_from_orb(light_orb, 110, 30)
-    save(tab, "tab")
-    save(brightness(tab, 1.08), "tab_hover")
-    save(pill_from_orb(purple_orb, 110, 30), "tab_selected")
+    tab = pill_from_orb(light_orb, px(110), px(30))
+    save(tab, out, "tab")
+    save(brightness(tab, 1.08), out, "tab_hover")
+    save(pill_from_orb(purple_orb, px(110), px(30)), out, "tab_selected")
 
     # Botones redondos de reproduccion: orbe + icono blanco.
     for action, icon_name, source in (("play", "play", blue_orb), ("pause", "pause", cyan_orb), ("stop", "stop", purple_orb)):
-        ball = orb(source, 38)
-        icon = svg_icon(src, icon_name, 16, ICON_WHITE)
-        face = overlay_center(ball, icon, dy=1)
-        save(face, f"orb_{action}")
-        save(brightness(face, 1.12), f"orb_{action}_hover")
-        save(brightness(face, 0.85), f"orb_{action}_pressed")
+        face = overlay_center(orb(source, px(38)), svg_icon(src, icon_name, px(16), ICON_WHITE), dy=px(1))
+        save(face, out, f"orb_{action}")
+        save(brightness(face, 1.12), out, f"orb_{action}_hover")
+        save(brightness(face, 0.85), out, f"orb_{action}_pressed")
 
     # Casillas: burbuja vacia / orbe azul con check.
-    def with_gap(image: Image.Image, gap: int = 6) -> Image.Image:
+    def with_gap(image: Image.Image) -> Image.Image:
         # Margen transparente a la derecha: separa la casilla de su texto.
-        canvas = Image.new("RGBA", (image.width + gap, image.height), (0, 0, 0, 0))
+        canvas = Image.new("RGBA", (image.width + px(6), image.height), (0, 0, 0, 0))
         canvas.alpha_composite(image)
         return canvas
 
-    bubble = orb(load(src, f"{archive}/bubbles/bubbles_22.png"), 20)
-    save(with_gap(bubble), "check_off")
-    save(with_gap(overlay_center(orb(blue_orb, 20), svg_icon(src, "check", 13, ICON_WHITE))), "check_on")
-    save(with_gap(brightness(bubble, 1.1)), "check_off_hover")
+    bubble = orb(load(src, f"{archive}/bubbles/bubbles_22.png"), px(20))
+    save(with_gap(bubble), out, "check_off")
+    save(with_gap(overlay_center(orb(blue_orb, px(20)), svg_icon(src, "check", px(13), ICON_WHITE))), out, "check_on")
+    save(with_gap(brightness(bubble, 1.1)), out, "check_off_hover")
 
     # Slider: perilla de orbe morado y riel claro.
-    save(orb(purple_orb, 18), "slider_thumb")
-    save(brightness(orb(purple_orb, 18), 1.15), "slider_thumb_hover")
+    save(orb(purple_orb, px(18)), out, "slider_thumb")
+    save(brightness(orb(purple_orb, px(18)), 1.15), out, "slider_thumb_hover")
     # El riel va centrado en un lienzo de la altura de la perilla, asi ttk no lo deforma.
-    trough = Image.new("RGBA", (60, 18), (0, 0, 0, 0))
-    trough.alpha_composite(pill_from_orb(light_orb, 60, 8), (0, 5))
-    save(trough, "slider_trough")
+    trough = Image.new("RGBA", (px(60), px(18)), (0, 0, 0, 0))
+    trough.alpha_composite(pill_from_orb(light_orb, px(60), px(8)), (0, px(5)))
+    save(trough, out, "slider_trough")
 
-    save(orb(green_orb, 14), "led_on")
-    save(orb(red_orb, 14), "led_off")
+    save(orb(green_orb, px(14)), out, "led_on")
+    save(orb(red_orb, px(14)), out, "led_off")
 
     # Iconos de pestanas y botones.
-    for name in ("musical-note", "sparkles", "command-line", "cog-6-tooth", "cpu-chip", "microphone", "speaker-wave"):
-        save(svg_icon(src, name, 18, ICON_DARK), f"icon_{name}")
-    for name in ("arrow-path", "folder-plus", "plus", "arrow-down-tray", "check", "microphone", "bolt", "arrow-top-right-on-square"):
-        save(svg_icon(src, name, 16, ICON_WHITE), f"icon_{name}_white")
-        save(svg_icon(src, name, 16, ICON_DARK), f"icon_{name}_dark")
-    save(svg_icon(src, "microphone", 18, ICON_PURPLE), "icon_microphone_purple")
+    for name in ("musical-note", "sparkles", "command-line", "cog-6-tooth", "cpu-chip", "microphone", "speaker-wave",
+                 "question-mark-circle"):
+        save(svg_icon(src, name, px(18), ICON_DARK), out, f"icon_{name}")
+    for name in ("arrow-path", "folder-plus", "plus", "arrow-down-tray", "check", "microphone", "bolt",
+                 "arrow-top-right-on-square", "book-open", "heart", "exclamation-triangle", "folder-open",
+                 "clipboard-document", "trash"):
+        save(svg_icon(src, name, px(16), ICON_WHITE), out, f"icon_{name}_white")
+        save(svg_icon(src, name, px(16), ICON_DARK), out, f"icon_{name}_dark")
+    save(svg_icon(src, "microphone", px(18), ICON_PURPLE), out, "icon_microphone_purple")
 
 
 # ---------------------------------------------------------------- sonidos
@@ -285,7 +302,7 @@ def read_wav(path: Path) -> tuple[np.ndarray, int]:
     return array[: len(array) // channels * channels].reshape(-1, channels), rate
 
 
-def write_sound(audio: np.ndarray, rate: int, name: str, max_seconds: float, peak_db: float) -> None:
+def write_sound(audio: np.ndarray, rate: int, name: str, max_seconds: float, peak_db: float, fade_seconds: float) -> None:
     if audio.shape[1] == 1:
         audio = np.repeat(audio, 2, axis=1)
     audio = audio[:, :2]
@@ -297,8 +314,9 @@ def write_sound(audio: np.ndarray, rate: int, name: str, max_seconds: float, pea
     end = min(len(audio), (loud[-1] if len(loud) else len(audio)) + int(0.06 * 44100), int(max_seconds * 44100))
     start = loud[0] if len(loud) else 0
     audio = audio[start:end]
-    fade = min(len(audio), int(0.08 * 44100))
-    audio[-fade:] *= np.linspace(1, 0, fade)[:, None]
+    # Fundido exponencial: la nota "se apaga" en vez de cortarse en seco.
+    fade = min(len(audio), int(fade_seconds * 44100))
+    audio[-fade:] *= (np.linspace(1, 0, fade) ** 2)[:, None]
     audio *= (10 ** (peak_db / 20)) / max(np.abs(audio).max(), 1e-6)
     with wave.open(str(SOUND_OUT / f"{name}.wav"), "wb") as handle:
         handle.setnchannels(2)
@@ -307,32 +325,39 @@ def write_sound(audio: np.ndarray, rate: int, name: str, max_seconds: float, pea
         handle.writeframes((audio * 32767).astype("<i2").tobytes())
 
 
+TRANQUILITY = "Audio/Helton Yan's Tranquility/MUSCMisc_"
+
 SOUNDS = {
-    # nombre: (ruta relativa, duracion maxima, pico en dBFS)
-    "click": ("Audio/SOUNDICONS/UI-UX/SELECT/Select0001.wav", 0.4, -16.0),
-    "toggle_on": ("Audio/SOUNDICONS/UI-UX/TURN/Turn0041.wav", 0.5, -15.0),
-    "toggle_off": ("Audio/SOUNDICONS/UI-UX/CANCEL/Cancel0001.wav", 0.4, -15.0),
-    "confirm": ("Audio/SOUNDICONS/UI-UX/DECISION/Decision0157.wav", 0.6, -13.0),
-    "open": ("Audio/SOUNDICONS/UI-UX/OPEN/Open0043.wav", 0.7, -14.0),
-    "close": ("Audio/SOUNDICONS/UI-UX/CLOSE/Close0042.wav", 0.5, -14.0),
-    "error": ("Audio/SOUNDICONS/UI-UX/ALARM/Alarm0095.wav", 0.6, -13.0),
-    "startup": ("Audio/Helton Yan's Tranquility/MUSCMisc_Minor-Sleek Startup_HY_Trnqlty.wav", 2.8, -14.0),
-    "notify": ("Audio/Helton Yan's Tranquility/MUSCMisc_Major-Tweeting Notification_HY_Trnqlty.wav", 1.8, -14.0),
+    # Todo sale de "Tranquility" (Helton Yan, estetica Frutiger Aero). Cada muestra es
+    # una frase larga: se toma solo la primera nota, recortada y con fundido.
+    # nombre: (archivo, duracion maxima s, pico dBFS, fundido s)
+    "click": (TRANQUILITY + "Major-Aqua Pluck_HY_Trnqlty.wav", 0.35, -18.0, 0.18),
+    "toggle_on": (TRANQUILITY + "Major-Glassy Gloss_HY_Trnqlty.wav", 0.40, -17.0, 0.20),
+    "toggle_off": (TRANQUILITY + "Minor-Underwater Pluck_HY_Trnqlty.wav", 0.35, -17.0, 0.18),
+    "confirm": (TRANQUILITY + "Minor-Lone Bell_HY_Trnqlty.wav", 0.70, -16.0, 0.35),
+    "open": (TRANQUILITY + "Major-Short Hover_HY_Trnqlty.wav", 0.80, -17.0, 0.35),
+    "close": (TRANQUILITY + "Major-Glassy Pluck_HY_Trnqlty.wav", 0.45, -18.0, 0.25),
+    "error": (TRANQUILITY + "Major-Bell Dissonance_HY_Trnqlty.wav", 0.80, -15.0, 0.35),
+    "startup": (TRANQUILITY + "Major-Breathy Startup_HY_Trnqlty.wav", 2.60, -15.0, 0.90),
+    "notify": (TRANQUILITY + "Major-Tweeting Notification_HY_Trnqlty.wav", 0.75, -15.0, 0.25),
 }
 
 
 def build_sounds(src: Path) -> None:
     SOUND_OUT.mkdir(parents=True, exist_ok=True)
-    for name, (relative, max_seconds, peak_db) in SOUNDS.items():
+    for name, (relative, max_seconds, peak_db, fade_seconds) in SOUNDS.items():
         audio, rate = read_wav(src / relative)
-        write_sound(audio, rate, name, max_seconds, peak_db)
+        write_sound(audio, rate, name, max_seconds, peak_db, fade_seconds)
 
 
 def main() -> None:
     src = Path(sys.argv[1]) if len(sys.argv) > 1 else PROJECT.parent / "ASSETS COOL"
-    build_images(src)
+    for stale in UI_OUT.glob("*.png"):  # formato anterior (una sola escala)
+        stale.unlink()
+    for percent in SCALES:
+        build_images(src, percent)
     build_sounds(src)
-    print(f"Listo: {len(list(UI_OUT.glob('*.png')))} imagenes y {len(list(SOUND_OUT.glob('*.wav')))} sonidos.")
+    print(f"Listo: {len(list(UI_OUT.rglob('*.png')))} imagenes en {len(SCALES)} escalas y {len(list(SOUND_OUT.glob('*.wav')))} sonidos.")
 
 
 if __name__ == "__main__":

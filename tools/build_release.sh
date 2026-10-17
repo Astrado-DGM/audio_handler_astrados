@@ -88,6 +88,7 @@ EOF
     --icon "$(winpath "$ROOT/visual/app.ico")" \
     --version-file "$(winpath "$PYI_DIR/version_info.txt")" \
     --add-data "$(winpath "$ROOT/visual");visual" \
+    --add-data "$(winpath "$ROOT/docs");docs" \
     --distpath "$(winpath "$PYI_DIR/dist")" \
     --workpath "$(winpath "$PYI_DIR/work")" \
     --specpath "$(winpath "$PYI_DIR")" \
@@ -106,6 +107,24 @@ PY
 
 if (( BUILD_SETUP )); then
     step "Generando setup.exe con Inno Setup"
+    # Creditos en texto plano UTF-8 con BOM (asi Inno muestra bien los acentos).
+    CREDITS_TXT="$PYI_DIR/creditos.txt"
+    "$VPY" - "$ROOT/docs/creditos.md" "$CREDITS_TXT" <<'PY'
+import sys, pathlib
+lines = []
+for raw in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    line = raw.replace("**", "").replace("`", "")
+    if line.startswith("# "):
+        title = line[2:].upper()
+        lines += [title, "=" * len(title)]
+    elif line.startswith("## "):
+        lines += [line[3:], "-" * len(line[3:])]
+    else:
+        stripped = line.lstrip(" ")
+        indent = line[: len(line) - len(stripped)]
+        lines.append(indent + "* " + stripped[2:] if stripped.startswith("- ") else line)
+pathlib.Path(sys.argv[2]).write_text("\r\n".join(lines) + "\r\n", encoding="utf-8-sig", newline="")
+PY
     ISCC=""
     for candidate in "$(command -v iscc 2>/dev/null || true)" "$(command -v ISCC 2>/dev/null || true)" \
         "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" "/c/Program Files/Inno Setup 6/ISCC.exe" \
@@ -123,6 +142,7 @@ if (( BUILD_SETUP )); then
         "/DSourceDir=$(winpath "$APP_DIR")" \
         "/DOutputDir=$(winpath "$RELEASE_DIR")" \
         "/DIconFile=$(winpath "$ROOT/visual/app.ico")" \
+        "/DCreditsFile=$(winpath "$CREDITS_TXT")" \
         "$(winpath "$ROOT/installer/AstradosAudioHandler.iss")"
 fi
 

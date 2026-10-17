@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 import time
 from pathlib import Path
@@ -9,7 +10,19 @@ import unicodedata
 
 import numpy as np
 
+from logic.errorLog import RateLimitedLogger
 from logic.micFilter import MicFilterSettings, MicProcessor
+
+log = logging.getLogger("astrados.audio")
+
+# Pseudo-dispositivos de PortAudio que significan "la salida predeterminada de Windows".
+WINDOWS_DEFAULT_OUTPUTS = {
+    "asignadordesonidomicrosoftoutput",
+    "microsoftsoundmapperoutput",
+    "controladorprimariodesonido",
+    "primarysounddriver",
+}
+_stream_log = RateLimitedLogger(log)
 
 try:
     import pygame
@@ -229,7 +242,7 @@ class _OutputMirror:
 
         resolved_device = resolve_device(self.device, "output")
         if resolved_device is None:
-            print(f"Monitor: no se encontro el dispositivo de salida {self.device!r}.")
+            log.warning("Monitor: no se encontro el dispositivo de salida %r.", self.device)
             return
 
         try:
@@ -244,13 +257,13 @@ class _OutputMirror:
             self.stream.start()
             self.active = True
         except Exception as error:
-            print(f"Monitor: no se pudo abrir la salida: {error}")
+            log.error("Monitor: no se pudo abrir la salida %r: %s", self.device, error)
             self.stream = None
             self.active = False
 
     def _callback(self, outdata, frames, time_info, status):
         if status:
-            print(status)
+            _stream_log.warning("monitor", f"Monitor: {status}")
 
         outdata.fill(0)
         if self.samples is None or self.samples.size == 0:
@@ -353,7 +366,11 @@ class singleSoundHandler:
             }
             cls.opened_device = None
             cls.fallback_warning = None
-            for candidate_name in _pygame_output_candidates(output_device):
+            # Los alias de "salida predeterminada" de Windows no existen para SDL:
+            # se abre la predeterminada directamente y no es un error.
+            uses_default = _normalize_name(_strip_device_label(output_device)) in WINDOWS_DEFAULT_OUTPUTS
+            candidates = [] if uses_default else _pygame_output_candidates(output_device)
+            for candidate_name in candidates:
                 try:
                     pygame.mixer.init(devicename=candidate_name, **mixer_kwargs)
                     cls.opened_device = candidate_name
@@ -367,7 +384,8 @@ class singleSoundHandler:
                     pygame.mixer.init(**mixer_kwargs)
                 except pygame.error:
                     pygame.mixer.init()
-                if output_device:
+                if output_device and not uses_default:
+                    log.warning("pygame no pudo abrir %r; se usa la salida predeterminada.", output_device)
                     cls.fallback_warning = (
                         f"No se pudo abrir {_strip_device_label(output_device)!r} para musica/SFX; "
                         "suenan por la salida predeterminada de Windows."
@@ -874,7 +892,7 @@ class soundMotor:
 
     def _mic_callback(self, indata, outdata, frames, time_info, status):
         if status:
-            print(status)
+            _stream_log.warning("mic", f"Microfono: {status}")
 
         outdata.fill(0)
         if indata.size == 0:
@@ -930,7 +948,7 @@ class soundMotor:
             self.mic_error = str(error)
             if hasattr(self.config_manager, "updateConfig"):
                 self.config_manager.updateConfig({"mic_active": False})
-            print(f"No se pudo iniciar el microfono: {error}")
+            log.error("No se pudo iniciar el microfono: %s", error)
             return False
 
         self.mic_error = None

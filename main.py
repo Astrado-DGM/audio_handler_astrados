@@ -9,6 +9,7 @@ La app organiza musica, SFX y microfono en una sola salida local y permite:
 from __future__ import annotations
 
 import ctypes
+import logging
 import queue
 import re
 import os
@@ -27,7 +28,7 @@ from tkinter import filedialog, messagebox, ttk
 from tkinter import font as tkfont
 
 from appinfo import APP_NAME, APP_VERSION
-from logic import uiTheme
+from logic import errorLog, uiTheme
 from logic.congifHandler import DEFAULT_HOTKEYS, configHandler
 from logic.soundMotor import resolve_device, soundMotor
 from logic.uiSounds import UiSounds
@@ -52,7 +53,11 @@ SFX_DIR = DATA_DIR / "sfx"
 RECORDINGS_DIR = DATA_DIR / "recordings"
 CONFIG_DIR = DATA_DIR / "config"
 VISUAL_DIR = RESOURCE_DIR / "visual"
+DOCS_DIR = RESOURCE_DIR / "docs"
+LOG_DIR = DATA_DIR / "logs"
 TRACK_EXTENSIONS = {".mp3"}
+
+log = logging.getLogger("astrados")
 
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
@@ -110,7 +115,7 @@ class AudioAsset:
 
 
 def ensure_project_directories() -> None:
-    for folder in (DATA_DIR, MUSIC_DIR, SFX_DIR, RECORDINGS_DIR, CONFIG_DIR):
+    for folder in (DATA_DIR, MUSIC_DIR, SFX_DIR, RECORDINGS_DIR, CONFIG_DIR, LOG_DIR):
         folder.mkdir(parents=True, exist_ok=True)
 
 
@@ -242,6 +247,14 @@ def hotkey_spec_from_event(event: tk.Event) -> str | None:
     return "+".join(parts)
 
 
+def center_over(window: tk.Toplevel, parent: tk.Misc) -> None:
+    """Centra un dialogo sobre la ventana principal (si no, Windows lo deja en una esquina)."""
+    window.update_idletasks()
+    x = parent.winfo_rootx() + (parent.winfo_width() - window.winfo_reqwidth()) // 2
+    y = parent.winfo_rooty() + (parent.winfo_height() - window.winfo_reqheight()) // 3
+    window.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+
 class HotkeyCaptureDialog(tk.Toplevel):
     def __init__(self, parent: tk.Misc, label: str, current_value: str) -> None:
         super().__init__(parent)
@@ -265,6 +278,7 @@ class HotkeyCaptureDialog(tk.Toplevel):
 
         self.bind("<KeyPress>", self._on_key_press)
         self.bind("<Escape>", self._cancel)
+        center_over(self, parent.winfo_toplevel())
         self.after(50, self.focus_force)
 
     def _on_key_press(self, event: tk.Event) -> None:
@@ -404,6 +418,103 @@ class GlobalHotkeyManager:
         self._thread = None
 
 
+class DocumentView(ttk.Frame):
+    """Visor de texto con formato minimo de Markdown (titulos, vinetas, **negrita**, `codigo`)."""
+
+    INLINE = re.compile(r"(\*\*.+?\*\*|`.+?`)")
+
+    def __init__(self, parent: tk.Misc, theme: uiTheme.Theme) -> None:
+        super().__init__(parent, style="Card.TFrame")
+        px = theme.px
+        self.text = tk.Text(
+            self, wrap="word", relief="flat", borderwidth=0, highlightthickness=0,
+            bg=uiTheme.CARD_BG, fg=uiTheme.TEXT, font=(uiTheme.FONT, 10),
+            padx=px(20), pady=px(14), cursor="arrow", spacing1=px(2), spacing3=px(2),
+            selectbackground=uiTheme.BLUE, selectforeground="white",
+        )
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.text.yview)
+        self.text.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        self.text.pack(side="left", fill="both", expand=True)
+
+        text = self.text
+        text.tag_configure("h1", font=(uiTheme.FONT, 17, "bold"), foreground=uiTheme.TEXT, spacing1=px(4), spacing3=px(8))
+        text.tag_configure("h2", font=(uiTheme.FONT, 12, "bold"), foreground=uiTheme.PURPLE, spacing1=px(14), spacing3=px(4))
+        text.tag_configure("bold", font=(uiTheme.FONT, 10, "bold"))
+        text.tag_configure("code", font=("Consolas", 9), background=uiTheme.CARD_ALT_BG, foreground=uiTheme.PURPLE)
+        text.tag_configure("item", lmargin1=px(14), lmargin2=px(30))
+        text.tag_configure("item2", lmargin1=px(38), lmargin2=px(54))
+        text.tag_configure("cont", lmargin1=px(30), lmargin2=px(30))
+        text.tag_configure("log", font=("Consolas", 9), foreground=uiTheme.TEXT)
+        text.tag_configure("log_warning", foreground=uiTheme.WARN)
+        text.tag_configure("log_error", foreground=uiTheme.ERROR_RED)
+        text.tag_configure("muted", foreground=uiTheme.MUTED)
+        # Linea en blanco del Markdown: un respiro corto, no una linea entera.
+        text.tag_configure("gap", font=(uiTheme.FONT, 3))
+        text.configure(state="disabled")
+
+    def _insert_inline(self, line: str, tags: tuple[str, ...]) -> None:
+        for piece in self.INLINE.split(line):
+            if not piece:
+                continue
+            if piece.startswith("**") and piece.endswith("**"):
+                self.text.insert("end", piece[2:-2], tags + ("bold",))
+            elif piece.startswith("`") and piece.endswith("`"):
+                self.text.insert("end", piece[1:-1], tags + ("code",))
+            else:
+                self.text.insert("end", piece, tags)
+
+    def show_markdown(self, markdown: str) -> None:
+        text = self.text
+        text.configure(state="normal")
+        text.delete("1.0", "end")
+        for raw in markdown.splitlines():
+            stripped = raw.strip()
+            indent = len(raw) - len(raw.lstrip(" "))
+            if raw.startswith("# "):
+                text.insert("end", raw[2:] + "\n", ("h1",))
+            elif raw.startswith("## "):
+                text.insert("end", raw[3:] + "\n", ("h2",))
+            elif stripped.startswith("- "):
+                tag = "item2" if indent >= 2 else "item"
+                text.insert("end", "\u2022  ", (tag,))
+                self._insert_inline(stripped[2:], (tag,))
+                text.insert("end", "\n", (tag,))
+            elif re.match(r"^\d+\. ", stripped):
+                number, rest = stripped.split(" ", 1)
+                text.insert("end", number + "  ", ("item", "bold"))
+                self._insert_inline(rest, ("item",))
+                text.insert("end", "\n", ("item",))
+            elif not stripped:
+                text.insert("end", "\n", ("gap",))
+            elif indent >= 2:
+                self._insert_inline(stripped, ("cont",))
+                text.insert("end", "\n", ("cont",))
+            else:
+                self._insert_inline(stripped, ())
+                text.insert("end", "\n")
+        text.configure(state="disabled")
+        text.yview_moveto(0)
+
+    def show_log(self, content: str, path: Path | None) -> None:
+        text = self.text
+        text.configure(state="normal")
+        text.delete("1.0", "end")
+        text.insert("end", "Log de errores\n", ("h1",))
+        text.insert("end", f"{path}\n\n" if path else "\n", ("muted",))
+        if not content.strip():
+            text.insert("end", "Sin errores registrados.\n", ("log",))
+        for line in content.splitlines():
+            tags: tuple[str, ...] = ("log",)
+            if "[ERROR]" in line or "[CRITICAL]" in line:
+                tags += ("log_error",)
+            elif "[WARNING]" in line:
+                tags += ("log_warning",)
+            text.insert("end", line + "\n", tags)
+        text.configure(state="disabled")
+        text.see("end")
+
+
 class AudioLibraryPanel(ttk.Frame):
     def __init__(
         self,
@@ -520,7 +631,7 @@ class AudioLibraryPanel(ttk.Frame):
         for asset in filtered_assets:
             row = uiTheme.card(self.content)
             row.pack(fill="x", pady=4, padx=(0, 6))
-            row.columnconfigure(0, minsize=260)
+            row.columnconfigure(0, minsize=self.theme.px(260))
             row.columnconfigure(1, weight=1)
 
             text_frame = ttk.Frame(row, style="Card.TFrame")
@@ -582,9 +693,13 @@ class AudioHandlerApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(f"{APP_TITLE} v{APP_VERSION}")
-        self.root.geometry("1200x820")
-        self.root.minsize(1060, 700)
         self.theme = uiTheme.Theme(root, VISUAL_DIR / "ui")
+        px = self.theme.px
+        # La ventana inicial no debe pasarse del area de trabajo con escalados altos.
+        width = min(px(1200), root.winfo_screenwidth() - px(40))
+        height = min(px(820), root.winfo_screenheight() - px(120))
+        self.root.geometry(f"{width}x{height}")
+        self.root.minsize(min(px(1060), width), min(px(700), height))
         self.root.iconphoto(True, self.theme.image("app_icon"))
         self._ui_ready = False
 
@@ -647,6 +762,7 @@ class AudioHandlerApp:
         self.root.after(150, self._poll_playback_state)
         self.root.after(50, self._tick_audio)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.report_callback_exception = self._report_tk_error
         self._bind_ui_sounds()
         self._ui_ready = True
         self.root.after(250, lambda: self.ui_sounds.play("startup"))
@@ -700,6 +816,7 @@ class AudioHandlerApp:
         self.hotkeys_tab = self._build_hotkeys_tab(self.notebook)
         self.config_tab = self._build_config_tab(self.notebook)
         self.engine_tab = self._build_engine_tab(self.notebook)
+        self.help_tab = self._build_help_tab(self.notebook)
 
         for widget, text, icon in (
             (self.music_panel, "Musica", "icon_musical-note"),
@@ -707,6 +824,7 @@ class AudioHandlerApp:
             (self.hotkeys_tab, "Atajos", "icon_command-line"),
             (self.config_tab, "Config", "icon_cog-6-tooth"),
             (self.engine_tab, "Motor", "icon_cpu-chip"),
+            (self.help_tab, "Ayuda", "icon_question-mark-circle"),
         ):
             self.notebook.add(widget, text=f" {text}", image=images[icon], compound="left")
         self.notebook.bind("<<NotebookTabChanged>>", lambda _event: self._ui_ready and self.ui_sounds.play("click"))
@@ -717,32 +835,34 @@ class AudioHandlerApp:
 
     def _build_header(self) -> None:
         images = self.theme.images
-        header = tk.Canvas(self.root, height=112, highlightthickness=0, bg=uiTheme.PAGE_BG)
+        px = self.theme.px
+        header = tk.Canvas(self.root, height=px(112), highlightthickness=0, bg=uiTheme.PAGE_BG)
         header.pack(fill="x", side="top")
         header.create_image(0, 0, image=images["header"], anchor="nw")
-        bubbles = header.create_image(1200, 4, image=images["header_bubbles"], anchor="ne")
-        header.create_image(14, 8, image=images["logo"], anchor="nw")
-        for offset, color in ((2, "#2a1660"), (0, "white")):
-            header.create_text(120 + offset, 40 + offset, text=APP_TITLE, anchor="w", fill=color, font=(uiTheme.FONT, 24, "bold"))
-        header.create_text(122, 76, anchor="w", fill="#eef4ff", font=(uiTheme.FONT, 10),
+        bubbles = header.create_image(px(1200), px(4), image=images["header_bubbles"], anchor="ne")
+        header.create_image(px(14), px(8), image=images["logo"], anchor="nw")
+        for offset, color in ((px(2), "#2a1660"), (0, "white")):
+            header.create_text(px(120) + offset, px(40) + offset, text=APP_TITLE, anchor="w", fill=color, font=(uiTheme.FONT, 24, "bold"))
+        header.create_text(px(122), px(76), anchor="w", fill="#eef4ff", font=(uiTheme.FONT, 10),
                            text="Musica, SFX y microfono mezclados en una sola salida para Discord.")
-        header.bind("<Configure>", lambda event: header.coords(bubbles, event.width - 18, 4))
+        header.bind("<Configure>", lambda event: header.coords(bubbles, event.width - px(18), px(4)))
 
     def _build_status_bar(self) -> None:
         images = self.theme.images
-        bar = tk.Canvas(self.root, height=30, highlightthickness=0, bg=uiTheme.PAGE_BG)
+        px = self.theme.px
+        bar = tk.Canvas(self.root, height=px(30), highlightthickness=0, bg=uiTheme.PAGE_BG)
         bar.pack(fill="x", side="bottom")
         bar.create_image(0, 0, image=images["statusbar"], anchor="nw")
         bar.create_line(0, 0, 4000, 0, fill=uiTheme.BORDER)
         status_font = tkfont.Font(root=self.root, family=uiTheme.FONT, size=9)
-        status_item = bar.create_text(14, 15, anchor="w", fill=uiTheme.TEXT, font=status_font, text=self.status_text.get())
-        self._mic_led_item = bar.create_image(1000, 15, image=images["led_off"], anchor="e")
-        self._mic_led_text = bar.create_text(1000, 15, anchor="e", fill=uiTheme.TEXT, font=(uiTheme.FONT, 9, "bold"), text="Microfono apagado")
+        status_item = bar.create_text(px(14), px(15), anchor="w", fill=uiTheme.TEXT, font=status_font, text=self.status_text.get())
+        self._mic_led_item = bar.create_image(px(1000), px(15), image=images["led_off"], anchor="e")
+        self._mic_led_text = bar.create_text(px(1000), px(15), anchor="e", fill=uiTheme.TEXT, font=(uiTheme.FONT, 9, "bold"), text="Microfono apagado")
         self._status_canvas = bar
 
         def refresh_text(*_args: Any) -> None:
             led_left = bar.bbox(self._mic_led_item)[0] if bar.bbox(self._mic_led_item) else bar.winfo_width()
-            available = max(80, led_left - 30)
+            available = max(px(80), led_left - px(30))
             text = self.status_text.get()
             if status_font.measure(text) > available:
                 while text and status_font.measure(text + "...") > available:
@@ -752,9 +872,9 @@ class AudioHandlerApp:
 
         def relayout(_event: tk.Event | None = None) -> None:
             width = bar.winfo_width()
-            bar.coords(self._mic_led_text, width - 14, 15)
+            bar.coords(self._mic_led_text, width - px(14), px(15))
             text_box = bar.bbox(self._mic_led_text)
-            bar.coords(self._mic_led_item, width - 20 - (text_box[2] - text_box[0]), 15)
+            bar.coords(self._mic_led_item, width - px(20) - (text_box[2] - text_box[0]), px(15))
             refresh_text()
 
         self._relayout_status = relayout
@@ -862,7 +982,7 @@ class AudioHandlerApp:
         self.monitor_device_combo = ttk.Combobox(devices, textvariable=self.device_vars["monitor_output_device"], state="readonly")
         self.monitor_device_combo.grid(row=2, column=1, sticky="ew", pady=5)
 
-        self.cable_status_label = ttk.Label(devices, textvariable=self.cable_status_text, style="Status.TLabel", wraplength=470, justify="left")
+        self.cable_status_label = ttk.Label(devices, textvariable=self.cable_status_text, style="Status.TLabel", wraplength=self.theme.px(470), justify="left")
         self.cable_status_label.grid(row=3, column=0, columnspan=2, sticky="w", pady=(10, 6))
         cable_buttons = ttk.Frame(devices, style="Card.TFrame")
         cable_buttons.grid(row=4, column=0, columnspan=2, sticky="w")
@@ -907,7 +1027,7 @@ class AudioHandlerApp:
         meter.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(10, 6))
         ttk.Label(meter, image=self.theme.image("icon_microphone_purple"), style="Meter.TLabel", background=uiTheme.CARD_ALT_BG).pack(side="left", padx=(8, 4), pady=6)
         ttk.Label(meter, textvariable=self.mic_level_text, style="Meter.TLabel", background=uiTheme.CARD_ALT_BG,
-                  wraplength=430, justify="left").pack(side="left", pady=6)
+                  wraplength=self.theme.px(430), justify="left").pack(side="left", pady=6)
 
         ttk.Label(
             section,
@@ -918,7 +1038,7 @@ class AudioHandlerApp:
                 "del nivel de salida en silencio."
             ),
             style="CardMuted.TLabel",
-            wraplength=470,
+            wraplength=self.theme.px(470),
             justify="left",
         ).grid(row=8, column=0, columnspan=3, sticky="w")
 
@@ -967,16 +1087,91 @@ class AudioHandlerApp:
         ):
             ttk.Label(flow, text=f"-  {step}", style="Card.TLabel").pack(anchor="w", pady=2)
 
-        credits = ttk.LabelFrame(inner, text=" Creditos de recursos ", padding=12)
-        credits.pack(fill="x", pady=(12, 0))
-        for line in (
-            "Iconos: Heroicons by Tailwind Labs (heroicons.com) - Licencia MIT",
-            "Sonidos de interfaz: SOUNDICONS by BRAINSTORM co.,ltd. (soundicons.net)",
-            "Sonidos de inicio y aviso: \"Tranquility\" de Helton Yan y Roberto Araujo - CC BY 4.0",
-            "Imagenes Frutiger Aero: Asadal (asadal.com) via Frutiger Aero Archive (frutigeraeroarchive.org)",
-        ):
-            ttk.Label(credits, text=line, style="Card.TLabel").pack(anchor="w", pady=2)
+        ttk.Button(inner, text=" Ver creditos de recursos", image=self.theme.image("icon_heart_dark"), compound="left",
+                   style="Light.TButton", command=lambda: self._open_help("credits")).pack(anchor="w", pady=(12, 0))
         return page
+
+    def _build_help_tab(self, parent: ttk.Notebook) -> ttk.Frame:
+        page = ttk.Frame(parent, padding=(16, 14, 16, 8))
+        self._page_heading(page, "Ayuda", "Manual de uso, creditos de los recursos y registro de errores.")
+
+        body = ttk.Frame(page)
+        body.pack(fill="both", expand=True)
+        nav = ttk.Frame(body)
+        nav.pack(side="left", fill="y", padx=(0, 12))
+        holder = uiTheme.card(body)
+        holder.pack(side="left", fill="both", expand=True)
+
+        self.help_toolbar = ttk.Frame(holder, style="Card.TFrame", padding=(12, 8, 12, 0))
+        images = self.theme.images
+        for text, icon, command in (
+            (" Actualizar", "icon_arrow-path_dark", lambda: self._show_help("log")),
+            (" Copiar", "icon_clipboard-document_dark", self._copy_log),
+            (" Abrir carpeta", "icon_folder-open_dark", self._open_log_folder),
+            (" Limpiar", "icon_trash_dark", self._clear_log),
+        ):
+            ttk.Button(self.help_toolbar, text=text, image=images[icon], compound="left", style="Light.TButton",
+                       command=command).pack(side="left", padx=(0, 6))
+        self.help_view = DocumentView(holder, self.theme)
+        self.help_view.pack(fill="both", expand=True)
+
+        self.help_buttons: dict[str, ttk.Button] = {}
+        for key, text, icon in (
+            ("manual", " Manual de uso", "book-open"),
+            ("credits", " Creditos", "heart"),
+            ("log", " Log de errores", "exclamation-triangle"),
+        ):
+            button = ttk.Button(nav, text=text, compound="left", command=lambda current=key: self._show_help(current))
+            button.pack(fill="x", pady=(0, 8))
+            self.help_buttons[key] = button
+        self._help_icons = {"manual": "book-open", "credits": "heart", "log": "exclamation-triangle"}
+        self._show_help("manual")
+        return page
+
+    def _show_help(self, key: str) -> None:
+        for name, button in self.help_buttons.items():
+            selected = name == key
+            icon = self._help_icons[name]
+            button.configure(style="Purple.TButton" if selected else "Light.TButton",
+                             image=self.theme.image(f"icon_{icon}_{'white' if selected else 'dark'}"))
+        if key == "log":
+            self.help_toolbar.pack(fill="x", before=self.help_view)
+            self.help_view.show_log(errorLog.read_log(), errorLog.log_path())
+            return
+        self.help_toolbar.pack_forget()
+        filename = "manual.md" if key == "manual" else "creditos.md"
+        try:
+            content = (DOCS_DIR / filename).read_text(encoding="utf-8")
+        except OSError as error:
+            log.error("No se pudo abrir %s: %s", filename, error)
+            content = f"# No se encontro {filename}\n\nReinstala la aplicacion."
+        self.help_view.show_markdown(content)
+
+    def _copy_log(self) -> None:
+        self.root.clipboard_clear()
+        self.root.clipboard_append(errorLog.read_log())
+        self.ui_sounds.play("confirm")
+        self._set_status("Log copiado al portapapeles.")
+
+    def _open_log_folder(self) -> None:
+        path = errorLog.log_path()
+        if path is not None:
+            os.startfile(path.parent)
+
+    def _clear_log(self) -> None:
+        if messagebox.askyesno("Log de errores", "Se borrara el registro de errores. Continuar?", parent=self.root):
+            errorLog.clear_log()
+            self._show_help("log")
+            self._set_status("Log de errores limpiado.")
+
+    def _report_tk_error(self, exc_type, exc_value, exc_traceback) -> None:
+        log.error("Error en la interfaz", exc_info=(exc_type, exc_value, exc_traceback))
+        self.ui_sounds.play("error")
+        self._set_status("Ocurrio un error inesperado. Detalles en Ayuda > Log de errores.")
+
+    def _open_help(self, key: str) -> None:
+        self.notebook.select(self.help_tab)
+        self._show_help(key)
 
     def _set_status(self, message: str) -> None:
         self.status_text.set(message)
@@ -1177,6 +1372,7 @@ class AudioHandlerApp:
         ttk.Button(buttons, text="Buscar de nuevo", style="Light.TButton", command=rescan).pack(side="left", padx=8)
         ttk.Button(buttons, text="Cerrar", style="Light.TButton", command=close).pack(side="right")
         dialog.protocol("WM_DELETE_WINDOW", close)
+        center_over(dialog, self.root)
 
     def _collect_settings(self) -> dict[str, Any]:
         return {
@@ -1220,8 +1416,11 @@ class AudioHandlerApp:
         self._register_hotkeys()
         self._sync_music_progress()
         warnings = list(self.device_warnings)
+        for warning in warnings:
+            log.warning(warning)
         if self.audio_motor.playback_warning:
             warnings.append(self.audio_motor.playback_warning)
+            log.warning(self.audio_motor.playback_warning)
         if self.bool_vars["mic_active"].get() and not self.audio_motor.mic_active:
             self.bool_vars["mic_active"].set(False)
             warnings.append(f"No se pudo iniciar el microfono: {self.audio_motor.mic_error}")
@@ -1420,11 +1619,14 @@ class AudioHandlerApp:
 
 def main() -> None:
     ensure_project_directories()
+    errorLog.setup_logging(LOG_DIR)
+    log.info("Inicio de %s v%s (%s)", APP_NAME, APP_VERSION, "instalado" if FROZEN else "desarrollo")
     # Sin esto la barra de tareas agrupa la ventana bajo el icono de Python.
     try:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Astrados.AudioHandler")
     except (AttributeError, OSError):
         pass
+    uiTheme.enable_dpi_awareness()
     root = tk.Tk()
     AudioHandlerApp(root)
     root.mainloop()
