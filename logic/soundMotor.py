@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -7,6 +8,8 @@ import re
 import unicodedata
 
 import numpy as np
+
+from logic.micFilter import MicFilterSettings, MicProcessor
 
 try:
     import pygame
@@ -57,148 +60,112 @@ def _strip_device_label(device_name: str | int | None) -> str:
     return text.strip()
 
 
-def _resolve_output_device_value(device_name: str | int | None) -> str | int | None:
-    if sd is None or device_name is None:
-        return device_name
-
+def _parse_device_label(device_name: str | int | None) -> tuple[int | None, str, str | None]:
+    """Separa "[5] CABLE Input (VB-Audio Virtual C (in:0 out:16) (MME)" en (5, nombre, host API)."""
+    if device_name is None:
+        return None, "", None
     if isinstance(device_name, int):
-        return device_name
+        return device_name, "", None
 
-    prefixed_index = _extract_device_index(device_name)
-    if prefixed_index is not None:
-        return prefixed_index
+    text = str(device_name).strip()
+    index = _extract_device_index(text)
+    hostapi_name: str | None = None
+    metadata_index = text.find(" (in:")
+    if metadata_index != -1:
+        hostapi_match = re.search(r"\(in:\d+ out:\d+\)\s*\(([^()]*)\)\s*$", text)
+        if hostapi_match:
+            hostapi_name = hostapi_match.group(1).strip() or None
+    return index, _strip_device_label(text), hostapi_name
 
-    normalized_target = _normalize_name(device_name)
-    fallback_index: int | None = None
 
+def _device_has_kind(device: dict[str, Any], kind: str) -> bool:
+    key = "max_input_channels" if kind == "input" else "max_output_channels"
+    return int(device.get(key, 0) or 0) > 0
+
+
+def _hostapi_name(hostapi_index: int) -> str:
     try:
-        devices = sd.query_devices()
+        return str(sd.query_hostapis(hostapi_index).get("name", ""))
     except Exception:
-        return device_name
-
-    for index, device in enumerate(devices):
-        if device.get("max_output_channels", 0) <= 0:
-            continue
-
-        normalized_name = _normalize_name(str(device.get("name", "")))
-        if normalized_name == normalized_target:
-            return index
-        if fallback_index is None and normalized_target and (
-            normalized_target in normalized_name or normalized_name in normalized_target
-        ):
-            fallback_index = index
-
-    return fallback_index if fallback_index is not None else device_name
+        return ""
 
 
-def _resolve_device_for_kind(device_name: str | int | None, kind: str) -> str | int | None:
-    if sd is None or device_name is None:
-        return device_name
-
-    resolved_index = _extract_device_index(device_name) if not isinstance(device_name, int) else device_name
-    if resolved_index is None:
-        resolved_index = None
-
-    try:
-        devices = sd.query_devices()
-    except Exception:
-        return device_name
-
-    def has_kind(index: int) -> bool:
-        device = devices[index]
-        if kind == "input":
-            return int(device.get("max_input_channels", 0) or 0) > 0
-        return int(device.get("max_output_channels", 0) or 0) > 0
-
-    if resolved_index is not None and 0 <= int(resolved_index) < len(devices) and has_kind(int(resolved_index)):
-        return int(resolved_index)
-
-    normalized_target = _normalize_name(str(device_name))
-    token_variants = [normalized_target]
-    if "output" in normalized_target:
-        token_variants.append(normalized_target.replace("output", "input"))
-    if "input" in normalized_target:
-        token_variants.append(normalized_target.replace("input", "output"))
-
-    best_match: int | None = None
-    for index, device in enumerate(devices):
-        if not has_kind(index):
-            continue
-
-        normalized_name = _normalize_name(str(device.get("name", "")))
-        if normalized_name in token_variants or any(variant in normalized_name for variant in token_variants if variant):
-            return index
-        if best_match is None:
-            best_match = index
-
-    return best_match if best_match is not None else device_name
+def _names_match(target: str, candidate: str) -> bool:
+    # MME recorta los nombres a 31 caracteres, por eso se acepta un prefijo.
+    return bool(target) and (target == candidate or candidate.startswith(target) or target.startswith(candidate))
 
 
-def _pygame_devicename_from_value(device_name: str | int | None) -> str | None:
+def resolve_device(device_name: str | int | None, kind: str, hostapi: int | None = None) -> int | None:
+    """Resuelve un dispositivo guardado por nombre (y host API), no por indice.
+
+    Los indices de PortAudio cambian al conectar o quitar dispositivos, asi que el
+    indice guardado solo se usa para desempatar entre dispositivos del mismo nombre.
+    Devuelve None si no hay coincidencia, en lugar de adivinar otro dispositivo.
+    """
     if sd is None or device_name is None:
         return None
 
-    if isinstance(device_name, int):
-        try:
-            return str(sd.query_devices(device_name).get("name", "")) or None
-        except Exception:
-            return None
-
-    prefixed_index = _extract_device_index(device_name)
-    if prefixed_index is not None:
-        try:
-            return str(sd.query_devices(prefixed_index).get("name", "")) or None
-        except Exception:
-            return None
-
-    stripped_name = _strip_device_label(device_name)
-    return stripped_name or str(device_name)
-
-
-def _pygame_output_candidates(device_name: str | int | None) -> list[str]:
-    if sd is None or device_name is None:
-        return []
-
-    candidate_indices: list[int] = []
-    resolved_index = _extract_device_index(device_name) if not isinstance(device_name, int) else device_name
-
     try:
         devices = sd.query_devices()
     except Exception:
-        resolved_name = _pygame_devicename_from_value(device_name)
-        return [resolved_name] if resolved_name else []
+        return None
 
-    normalized_target = _normalize_name(_strip_device_label(device_name))
-    if resolved_index is not None and 0 <= int(resolved_index) < len(devices):
-        candidate_indices.append(int(resolved_index))
+    saved_index, name, hostapi_name = _parse_device_label(device_name)
+    if not name:
+        if saved_index is not None and 0 <= saved_index < len(devices) and _device_has_kind(devices[saved_index], kind):
+            return saved_index
+        return None
 
-    for index, device in enumerate(devices):
-        if device.get("max_output_channels", 0) <= 0:
-            continue
+    target = _normalize_name(name)
+    matches = [
+        index
+        for index, device in enumerate(devices)
+        if _device_has_kind(device, kind) and _names_match(target, _normalize_name(str(device.get("name", ""))))
+    ]
+    if not matches:
+        return None
 
-        normalized_name = _normalize_name(str(device.get("name", "")))
-        if normalized_target and (
-            normalized_name == normalized_target
-            or normalized_target in normalized_name
-            or normalized_name in normalized_target
-        ):
-            if index not in candidate_indices:
-                candidate_indices.append(index)
+    if hostapi is not None:
+        same_hostapi = [index for index in matches if int(devices[index].get("hostapi", -1)) == int(hostapi)]
+        if not same_hostapi:
+            return None
+        matches = same_hostapi
+    elif hostapi_name:
+        same_hostapi = [index for index in matches if _hostapi_name(int(devices[index].get("hostapi", -1))) == hostapi_name]
+        matches = same_hostapi or matches
 
-    candidate_names: list[str] = []
-    for index in candidate_indices:
-        try:
-            candidate_name = str(devices[index].get("name", "")).strip()
-        except Exception:
-            continue
-        if candidate_name and candidate_name not in candidate_names:
-            candidate_names.append(candidate_name)
+    if saved_index in matches:
+        return saved_index
+    exact = [index for index in matches if _normalize_name(str(devices[index].get("name", ""))) == target]
+    return (exact or matches)[0]
 
-    resolved_name = _pygame_devicename_from_value(device_name)
-    if resolved_name and resolved_name not in candidate_names:
-        candidate_names.append(resolved_name)
 
-    return candidate_names
+def _pygame_output_candidates(device_name: str | int | None) -> list[str]:
+    """Nombres a probar con pygame/SDL, que usa los nombres completos (no los de MME)."""
+    if sd is None or device_name is None:
+        return []
+
+    _saved_index, name, _hostapi_name = _parse_device_label(device_name)
+    if not name:
+        resolved = resolve_device(device_name, "output")
+        if resolved is None:
+            return []
+        name = str(sd.query_devices(resolved).get("name", ""))
+
+    target = _normalize_name(name)
+    try:
+        devices = sd.query_devices()
+    except Exception:
+        return [name]
+
+    candidate_names = {
+        str(device.get("name", "")).strip()
+        for device in devices
+        if _device_has_kind(device, "output") and _names_match(target, _normalize_name(str(device.get("name", ""))))
+    }
+    candidate_names.add(name)
+    # Primero los nombres mas largos: son los completos que reporta WASAPI/DirectSound.
+    return sorted((candidate for candidate in candidate_names if candidate), key=len, reverse=True)
 
 
 def _sound_to_float32_array(sound: Any) -> np.ndarray | None:
@@ -254,7 +221,16 @@ class _OutputMirror:
         if sd is None or self.samples is None or self.device is None:
             return
 
-        resolved_device = _resolve_device_for_kind(self.device, "output")
+        self._open_stream()
+
+    def _open_stream(self) -> None:
+        if sd is None or self.samples is None:
+            return
+
+        resolved_device = resolve_device(self.device, "output")
+        if resolved_device is None:
+            print(f"Monitor: no se encontro el dispositivo de salida {self.device!r}.")
+            return
 
         try:
             self.stream = sd.OutputStream(
@@ -267,7 +243,8 @@ class _OutputMirror:
             assert self.stream is not None
             self.stream.start()
             self.active = True
-        except Exception:
+        except Exception as error:
+            print(f"Monitor: no se pudo abrir la salida: {error}")
             self.stream = None
             self.active = False
 
@@ -314,23 +291,7 @@ class _OutputMirror:
     def resume(self) -> None:
         if self.samples is None or sd is None or self.device is None or self.active:
             return
-
-        resolved_device = _resolve_device_for_kind(self.device, "output")
-
-        try:
-            self.stream = sd.OutputStream(
-                device=resolved_device,
-                samplerate=self.sample_rate,
-                channels=int(self.samples.shape[1]),
-                dtype="float32",
-                callback=self._callback,
-            )
-            assert self.stream is not None
-            self.stream.start()
-            self.active = True
-        except Exception:
-            self.stream = None
-            self.active = False
+        self._open_stream()
 
     def seek(self, start_seconds: float) -> None:
         self.frame_index = max(0, int(float(start_seconds) * self.sample_rate))
@@ -348,6 +309,9 @@ class _OutputMirror:
 class singleSoundHandler:
     _mixer_ready = False
     _current_device: str | None = None
+    # Nombre del dispositivo que pygame abrio realmente, o None si uso el de Windows.
+    opened_device: str | None = None
+    fallback_warning: str | None = None
 
     def __init__(
         self,
@@ -361,10 +325,12 @@ class singleSoundHandler:
         self.channel: Any = None
         self.loop = False
         self.volume = 1.0
+        self.duck_gain = 1.0
         self.paused = False
         self.monitor_enabled = False
         self.monitor_device: str | None = None
         self._mirror = _OutputMirror(output_device, 44100)
+        self._mirror_samples: np.ndarray | None = None
         self.max_channels = max(1, min(8, int(max_channels)))
         self._ensure_mixer(output_device)
         self.apply_config(config or {})
@@ -385,27 +351,27 @@ class singleSoundHandler:
                 "channels": 2,
                 "buffer": 1024,
             }
-            candidate_names = _pygame_output_candidates(output_device)
-            init_error: Exception | None = None
-
-            for candidate_name in candidate_names:
-                mixer_kwargs["devicename"] = candidate_name
+            cls.opened_device = None
+            cls.fallback_warning = None
+            for candidate_name in _pygame_output_candidates(output_device):
                 try:
-                    pygame.mixer.init(**mixer_kwargs)
+                    pygame.mixer.init(devicename=candidate_name, **mixer_kwargs)
+                    cls.opened_device = candidate_name
                     break
-                except (TypeError, pygame.error) as error:
-                    init_error = error
+                except (TypeError, pygame.error):
                     if pygame.mixer.get_init():
                         pygame.mixer.quit()
-                    continue
-            else:
-                mixer_kwargs.pop("devicename", None)
+
+            if cls.opened_device is None:
                 try:
                     pygame.mixer.init(**mixer_kwargs)
                 except pygame.error:
-                    if init_error is not None:
-                        raise init_error
                     pygame.mixer.init()
+                if output_device:
+                    cls.fallback_warning = (
+                        f"No se pudo abrir {_strip_device_label(output_device)!r} para musica/SFX; "
+                        "suenan por la salida predeterminada de Windows."
+                    )
 
         pygame.mixer.set_num_channels(8)
         cls._mixer_ready = True
@@ -425,6 +391,7 @@ class singleSoundHandler:
         cls._ensure_mixer(output_device)
 
     def set_source(self, soundFile: str | Path | None) -> None:
+        self._mirror_samples = None
         if soundFile is None:
             self.sound_file = None
             self.sound = None
@@ -436,8 +403,8 @@ class singleSoundHandler:
             self.sound = None
             return
 
+        # El volumen se aplica solo en el Channel; Sound queda en 1.0 para no elevarlo al cuadrado.
         self.sound = pygame.mixer.Sound(str(self.sound_file))
-        self.sound.set_volume(self.volume)
 
     def _clamp_volume(self, volume: Any) -> float:
         try:
@@ -445,25 +412,41 @@ class singleSoundHandler:
         except (TypeError, ValueError):
             return 1.0
 
+    def effective_volume(self) -> float:
+        return self.volume * self.duck_gain
+
+    def _apply_volume(self) -> None:
+        if self.channel is not None:
+            self.channel.set_volume(self.effective_volume())
+        self._mirror.volume = self.effective_volume()
+
+    def _monitor_samples(self) -> np.ndarray | None:
+        if self._mirror_samples is None:
+            self._mirror_samples = _sound_to_float32_array(self.sound)
+        return self._mirror_samples
+
+    def _start_monitor(self, loop: bool) -> None:
+        self._mirror.configure(
+            self._monitor_samples(),
+            start_seconds=0.0,
+            loop=loop,
+            volume=self.effective_volume(),
+            device=self.monitor_device,
+        )
+
     def apply_config(self, config: dict[str, Any]) -> None:
         self.volume = self._clamp_volume(config.get("volume", config.get("volume_music", config.get("volume_sfx", 1.0))))
         self.loop = bool(config.get("loop", config.get("loop_music", config.get("loop_sfx", False))))
-        self.monitor_enabled = bool(config.get("monitor_enabled", config.get("monitor_audio", False)))
+        monitor_enabled = bool(config.get("monitor_enabled", config.get("monitor_audio", False)))
         self.monitor_device = config.get("monitor_output_device") or None
-        if self.sound is not None:
-            self.sound.set_volume(self.volume)
-        if self.channel is not None and getattr(self.channel, "get_busy", lambda: False)():
-            self.channel.set_volume(self.volume)
-        if self.channel is not None and getattr(self.channel, "get_busy", lambda: False)() and self.monitor_enabled:
-            self._mirror.configure(
-                _sound_to_float32_array(self.sound),
-                start_seconds=0.0,
-                loop=self.loop,
-                volume=self.volume,
-                device=self.monitor_device,
-            )
-        elif not self.monitor_enabled:
+        self._apply_volume()
+        # Solo se (re)abre el espejo al activarlo; aplicar ajustes ya no lo reinicia desde 0.
+        if monitor_enabled and not self.monitor_enabled and self.is_playing() and not self.paused:
+            self.monitor_enabled = True
+            self._start_monitor(self.loop)
+        elif not monitor_enabled:
             self._mirror.stop()
+        self.monitor_enabled = monitor_enabled
 
     def set_monitor(self, enabled: bool, device: str | None) -> None:
         self.monitor_enabled = bool(enabled)
@@ -482,16 +465,9 @@ class singleSoundHandler:
 
         loop_enabled = self.loop if loop is None else bool(loop)
         self.channel = self.sound.play(loops=-1 if loop_enabled else 0)
-        if self.channel is not None:
-            self.channel.set_volume(self.volume)
+        self._apply_volume()
         if self.monitor_enabled:
-            self._mirror.configure(
-                _sound_to_float32_array(self.sound),
-                start_seconds=0.0,
-                loop=loop_enabled,
-                volume=self.volume,
-                device=self.monitor_device,
-            )
+            self._start_monitor(loop_enabled)
         self.paused = False
 
     def stop(self) -> None:
@@ -520,10 +496,11 @@ class singleSoundHandler:
 
     def set_volume(self, volume: float) -> None:
         self.volume = self._clamp_volume(volume)
-        if self.sound is not None:
-            self.sound.set_volume(self.volume)
-        if self.channel is not None and getattr(self.channel, "get_busy", lambda: False)():
-            self.channel.set_volume(self.volume)
+        self._apply_volume()
+
+    def set_duck_gain(self, gain: float) -> None:
+        self.duck_gain = max(0.0, min(1.0, float(gain)))
+        self._apply_volume()
 
     def is_playing(self) -> bool:
         return self.channel is not None and getattr(self.channel, "get_busy", lambda: False)()
@@ -536,19 +513,21 @@ class singleSoundHandler:
         if self.channel is not None and getattr(self.channel, "get_busy", lambda: False)():
             self.channel.stop()
             self.channel = self.sound.play(loops=-1 if self.loop else 0) if self.sound is not None else None
+            self._apply_volume()
             if self.monitor_enabled:
-                self._mirror.configure(
-                    _sound_to_float32_array(self.sound),
-                    start_seconds=0.0,
-                    loop=self.loop,
-                    volume=self.volume,
-                    device=self.monitor_device,
-                )
+                self._start_monitor(self.loop)
 
 
 class SeekableMusicHandler:
-    _mixer_ready = False
-    _current_device: str | None = None
+    """Musica con seek y loop.
+
+    Tras un seek se reproduce un Sound recortado (desde el punto elegido) y, si hay
+    loop, se encola la pista completa justo antes de que termine. Asi el loop vuelve
+    al inicio de la cancion y la posicion es simplemente (inicio + transcurrido) % duracion.
+    """
+
+    # Margen para encolar la siguiente vuelta; tick() se llama varias veces por segundo.
+    QUEUE_AHEAD_SECONDS = 1.5
 
     def __init__(
         self,
@@ -563,10 +542,12 @@ class SeekableMusicHandler:
         self.duration_seconds = 0.0
         self.loop = False
         self.volume = 1.0
+        self.duck_gain = 1.0
         self.paused = False
         self.monitor_enabled = False
         self.monitor_device: str | None = None
         self._mirror = _OutputMirror(None, 44100)
+        self._mirror_samples: np.ndarray | None = None
         self._play_started_at: float | None = None
         self._base_position_seconds = 0.0
         self._paused_position_seconds = 0.0
@@ -575,74 +556,46 @@ class SeekableMusicHandler:
 
     @classmethod
     def _ensure_mixer(cls, output_device: str | None) -> None:
-        if pygame is None:
-            cls._mixer_ready = False
-            cls._current_device = output_device
-            return
+        # El mixer de pygame es global: se comparte la logica de seleccion de dispositivo.
+        singleSoundHandler._ensure_mixer(output_device)
 
-        if not pygame.mixer.get_init():
-            mixer_kwargs: dict[str, Any] = {
-                "frequency": 44100,
-                "size": -16,
-                "channels": 2,
-                "buffer": 1024,
-            }
-            if output_device:
-                mixer_kwargs["devicename"] = output_device
-            try:
-                pygame.mixer.init(**mixer_kwargs)
-            except (TypeError, pygame.error):
-                mixer_kwargs.pop("devicename", None)
-                try:
-                    pygame.mixer.init(**mixer_kwargs)
-                except pygame.error:
-                    pygame.mixer.init()
-
-        pygame.mixer.set_num_channels(8)
-        cls._mixer_ready = True
-        cls._current_device = output_device
-
-    @classmethod
-    def reinitialize_mixer(cls, output_device: str | None) -> None:
-        if pygame is None:
-            cls._mixer_ready = False
-            cls._current_device = output_device
-            return
-
-        if pygame.mixer.get_init():
-            pygame.mixer.stop()
-            pygame.mixer.quit()
-        cls._mixer_ready = False
-        cls._ensure_mixer(output_device)
+    def _elapsed_position_seconds(self) -> float:
+        if self.paused:
+            return self._paused_position_seconds
+        if self._play_started_at is None:
+            return self._base_position_seconds
+        return self._base_position_seconds + max(0.0, time.monotonic() - self._play_started_at)
 
     def _current_position_seconds(self) -> float:
-        if self.paused:
-            position = self._paused_position_seconds
-        elif self._play_started_at is None:
-            position = self._base_position_seconds
-        else:
-            position = self._base_position_seconds + max(0.0, time.monotonic() - self._play_started_at)
-
+        position = self._elapsed_position_seconds()
         if self.duration_seconds > 0:
             if self.loop:
                 return position % self.duration_seconds
             return min(position, self.duration_seconds)
         return max(0.0, position)
 
-    def _current_monitor_device(self) -> str | None:
-        return self.monitor_device
+    def effective_volume(self) -> float:
+        return self.volume * self.duck_gain
+
+    def _apply_volume(self) -> None:
+        if self.channel is not None:
+            self.channel.set_volume(self.effective_volume())
+        self._mirror.volume = self.effective_volume()
 
     def _start_monitor(self, start_seconds: float) -> None:
         if not self.monitor_enabled:
             self._mirror.stop()
             return
 
+        # El espejo recorre la pista completa (no el tramo recortado), con su propio loop.
+        if self._mirror_samples is None:
+            self._mirror_samples = _sound_to_float32_array(self.sound)
         self._mirror.configure(
-            _sound_to_float32_array(self.playback_sound),
+            self._mirror_samples,
             start_seconds=start_seconds,
             loop=self.loop,
-            volume=self.volume,
-            device=self._current_monitor_device(),
+            volume=self.effective_volume(),
+            device=self.monitor_device,
         )
 
     def _build_playback_sound(self, start_seconds: float = 0.0) -> Any | None:
@@ -650,6 +603,8 @@ class SeekableMusicHandler:
             return None
 
         start_frame = max(0, min(int(float(start_seconds) * 44100), int(self.samples.shape[0])))
+        if start_frame == 0:
+            return self.sound
         sliced_samples = np.ascontiguousarray(self.samples[start_frame:])
         if sliced_samples.size == 0:
             return None
@@ -660,12 +615,12 @@ class SeekableMusicHandler:
             return self.sound
 
     def set_source(self, soundFile: str | Path | None) -> None:
+        self._mirror_samples = None
         if soundFile is None:
             self.sound_file = None
             self.sound = None
             self.samples = None
             self.playback_sound = None
-            self.channel = None
             self.duration_seconds = 0.0
             self.stop()
             return
@@ -692,16 +647,16 @@ class SeekableMusicHandler:
     def apply_config(self, config: dict[str, Any]) -> None:
         self.volume = self._clamp_volume(config.get("volume", config.get("volume_music", 1.0)))
         self.loop = bool(config.get("loop", config.get("loop_music", True)))
-        self.monitor_enabled = bool(config.get("monitor_enabled", config.get("monitor_audio", False)))
+        self._mirror.loop = self.loop
+        monitor_enabled = bool(config.get("monitor_enabled", config.get("monitor_audio", False)))
         self.monitor_device = config.get("monitor_output_device") or None
-        if pygame is not None and pygame.mixer.get_init():
-            pass
-        if self.sound is not None:
-            self.sound.set_volume(self.volume)
-        if self.playback_sound is not None and hasattr(self.playback_sound, "set_volume"):
-            self.playback_sound.set_volume(self.volume)
-        if self.paused:
-            self._paused_position_seconds = self._current_position_seconds()
+        self._apply_volume()
+        if monitor_enabled and not self.monitor_enabled and self.is_playing():
+            self.monitor_enabled = True
+            self._start_monitor(self._current_position_seconds())
+        elif not monitor_enabled:
+            self._mirror.stop()
+        self.monitor_enabled = monitor_enabled
 
     def play(self, soundFile: str | Path | None = None, loop: bool | None = None, start_seconds: float = 0.0) -> None:
         if soundFile is not None:
@@ -722,14 +677,27 @@ class SeekableMusicHandler:
         if self.channel is not None and getattr(self.channel, "get_busy", lambda: False)():
             self.channel.stop()
 
-        self.channel = self.playback_sound.play(loops=-1 if loop_enabled else 0)
-        if self.channel is not None:
-            self.channel.set_volume(self.volume)
+        # Siempre loops=0: el loop se arma encolando la pista completa en tick().
+        self.channel = self.playback_sound.play(loops=0)
+        self._apply_volume()
         self._base_position_seconds = start_seconds
         self._play_started_at = time.monotonic()
         self._paused_position_seconds = start_seconds
         self.paused = False
         self._start_monitor(start_seconds)
+        self.tick()
+
+    def tick(self) -> None:
+        """Encola la siguiente vuelta del loop cuando se acerca el final."""
+        if not self.loop or self.paused or self.channel is None or self.sound is None or self.duration_seconds <= 0:
+            return
+        if not getattr(self.channel, "get_busy", lambda: False)():
+            # Se perdio la ventana para encolar (UI bloqueada): se retoma desde el inicio.
+            self.play(loop=True, start_seconds=0.0)
+            return
+        remaining = self.duration_seconds - self._current_position_seconds()
+        if remaining <= self.QUEUE_AHEAD_SECONDS and self.channel.get_queue() is None:
+            self.channel.queue(self.sound)
 
     def stop(self) -> None:
         if self.channel is not None:
@@ -774,20 +742,23 @@ class SeekableMusicHandler:
 
     def set_volume(self, volume: float) -> None:
         self.volume = self._clamp_volume(volume)
-        if self.sound is not None:
-            self.sound.set_volume(self.volume)
-        if self.channel is not None and getattr(self.channel, "get_busy", lambda: False)():
-            self.channel.set_volume(self.volume)
+        self._apply_volume()
+
+    def set_duck_gain(self, gain: float) -> None:
+        self.duck_gain = max(0.0, min(1.0, float(gain)))
+        self._apply_volume()
 
     def set_loop(self, loop: bool) -> None:
         self.loop = bool(loop)
+        self._mirror.loop = self.loop
 
     def seek(self, seconds: float) -> None:
-        if self.sound_file is None:
+        if self.sound is None:
             return
 
         keep_paused = self.paused
-        self.play(self.sound_file, loop=self.loop, start_seconds=seconds)
+        # Sin pasar la ruta: re-decodificar el MP3 completo en cada seek era muy lento.
+        self.play(loop=self.loop, start_seconds=seconds)
         if keep_paused:
             self.pause()
 
@@ -810,11 +781,6 @@ class SeekableMusicHandler:
             "loop": self.loop,
         }
 
-    def update(self, current_config: dict[str, Any]) -> None:
-        self.apply_config(current_config)
-        if self.loop and self.sound is not None and (self.channel is None or not getattr(self.channel, "get_busy", lambda: False)()) and not self.paused:
-            self.play(self.sound_file, loop=self.loop, start_seconds=self._current_position_seconds())
-
 
 class soundMotor:
     def __init__(self, config_manager) -> None:
@@ -830,6 +796,13 @@ class soundMotor:
         self.mic_active = False
         self.mic_stream: Any | None = None
         self.mic_volume = float(self.config.get("volume_mic", 1.0))
+        self.mic_filter_settings = MicFilterSettings.from_config(self.config)
+        self.mic_processor: MicProcessor | None = None
+        self.mic_error: str | None = None
+        self.ducking_enabled = bool(self.config.get("mic_ducking", True))
+        self.ducking_level = float(self.config.get("mic_ducking_level", 0.4))
+        self._duck_gain = 1.0
+        self._last_tick: float | None = None
         self.music_source: Path | None = None
         self.sfx_source: Path | None = None
 
@@ -863,103 +836,41 @@ class soundMotor:
         except Exception:
             return None
 
-    def _resolve_device_index(self, device_name: str | None, kind: str, preferred_hostapi: int | None = None) -> int | None:
+    def _selected_device_pair(self) -> tuple[int, int]:
         if sd is None:
-            return None
+            raise RuntimeError("sounddevice no esta disponible en este entorno.")
 
-        if device_name is None:
-            return None
-
-        if isinstance(device_name, int):
-            return device_name
-
-        prefixed_index = _extract_device_index(device_name)
-        if prefixed_index is not None:
-            return prefixed_index
-
-        devices = sd.query_devices()
-        normalized_target = _normalize_name(device_name)
-        fallback_same_kind: int | None = None
-        fallback_exact: int | None = None
-
-        for index, device in enumerate(devices):
-            if kind == "input" and device.get("max_input_channels", 0) <= 0:
-                continue
-            if kind == "output" and device.get("max_output_channels", 0) <= 0:
-                continue
-
-            normalized_name = _normalize_name(str(device.get("name", "")))
-            exact_match = normalized_name == normalized_target
-            partial_match = normalized_target and (
-                normalized_target in normalized_name or normalized_name in normalized_target
-            )
-
-            if preferred_hostapi is not None and int(device.get("hostapi", -1)) == int(preferred_hostapi):
-                if exact_match or partial_match:
-                    return index
-                if fallback_same_kind is None:
-                    fallback_same_kind = index
-                continue
-
-            if exact_match or partial_match:
-                if fallback_exact is None:
-                    fallback_exact = index
-
-        if fallback_same_kind is not None:
-            return fallback_same_kind
-        return fallback_exact
-
-    def _resolve_fallback_device(self, kind: str, preferred_hostapi: int | None = None) -> int | None:
-        if sd is None:
-            return None
-
-        devices = sd.query_devices()
-        fallback_index: int | None = None
-        for index, device in enumerate(devices):
-            if kind == "input" and device.get("max_input_channels", 0) <= 0:
-                continue
-            if kind == "output" and device.get("max_output_channels", 0) <= 0:
-                continue
-
-            if preferred_hostapi is not None and int(device.get("hostapi", -1)) == int(preferred_hostapi):
-                return index
-
-            if fallback_index is None:
-                fallback_index = index
-
-        return fallback_index
-
-    def _selected_device_pair(self) -> tuple[int | None, int | None]:
-        output_index = self._resolve_device_index(self.output_device, "output")
-        output_info = self._device_info(output_index)
-        preferred_hostapi = int(output_info.get("hostapi", -1)) if output_info is not None else None
-
-        input_index = self._resolve_device_index(self.mic_input_device, "input", preferred_hostapi=preferred_hostapi)
-
+        output_index = resolve_device(self.output_device, "output")
         if output_index is None:
-            output_index = self._resolve_fallback_device("output", preferred_hostapi=preferred_hostapi)
-            output_info = self._device_info(output_index)
-            preferred_hostapi = int(output_info.get("hostapi", -1)) if output_info is not None else None
+            raise ValueError(f"No se encontro la salida {_strip_device_label(self.output_device) or '(sin seleccionar)'!r}.")
 
-        if input_index is None:
-            input_index = self._resolve_fallback_device("input", preferred_hostapi=preferred_hostapi)
+        if self.mic_input_device:
+            input_index = resolve_device(self.mic_input_device, "input")
+            if input_index is None:
+                raise ValueError(f"No se encontro el microfono {_strip_device_label(self.mic_input_device)!r}.")
+        else:
+            input_index = int(sd.default.device[0])
+            if input_index < 0:
+                raise ValueError("No hay microfono seleccionado ni microfono predeterminado en Windows.")
 
-        if input_index is None or output_index is None:
+        output_hostapi = int(sd.query_devices(output_index).get("hostapi", -1))
+        input_hostapi = int(sd.query_devices(input_index).get("hostapi", -1))
+        if input_hostapi == output_hostapi:
             return input_index, output_index
 
-        input_info = self._device_info(input_index)
-        output_info = self._device_info(output_index)
-        if input_info is None or output_info is None:
-            return input_index, output_index
+        # sd.Stream exige la misma host API: se busca el MISMO dispositivo en la otra
+        # API en lugar de caer al primero que aparezca (que podian ser los altavoces).
+        same_input = resolve_device(self.mic_input_device or sd.query_devices(input_index)["name"], "input", hostapi=output_hostapi)
+        if same_input is not None:
+            return same_input, output_index
+        same_output = resolve_device(self.output_device, "output", hostapi=input_hostapi)
+        if same_output is not None:
+            return input_index, same_output
 
-        if int(input_info.get("hostapi", -1)) != int(output_info.get("hostapi", -1)):
-            preferred_hostapi = int(output_info.get("hostapi", -1))
-            hostapi_input = self._resolve_fallback_device("input", preferred_hostapi=preferred_hostapi)
-            hostapi_output = self._resolve_fallback_device("output", preferred_hostapi=preferred_hostapi)
-            if hostapi_input is not None and hostapi_output is not None:
-                return hostapi_input, hostapi_output
-
-        return input_index, output_index
+        raise ValueError(
+            f"El microfono ({_hostapi_name(input_hostapi)}) y la salida ({_hostapi_name(output_hostapi)}) "
+            "usan host APIs distintas y no hay una version comun; elige ambos en la misma API (ej. MME o WASAPI)."
+        )
 
     def _mic_callback(self, indata, outdata, frames, time_info, status):
         if status:
@@ -969,26 +880,16 @@ class soundMotor:
         if indata.size == 0:
             return
 
-        data = indata * float(self.mic_volume)
-        if getattr(data, "ndim", 2) == 1:
-            data = data[:, None]
+        # El microfono es mono en la practica: se promedia y se filtra una sola vez.
+        mono = indata.mean(axis=1) if indata.ndim == 2 else indata
+        processor = self.mic_processor
+        if processor is not None:
+            mono = processor.process(mono)
 
-        input_channels = data.shape[1]
-        output_channels = outdata.shape[1]
-        channels_to_copy = min(input_channels, output_channels)
-        outdata[:, :channels_to_copy] = data[:, :channels_to_copy]
-
-        if output_channels > channels_to_copy and channels_to_copy > 0:
-            outdata[:, channels_to_copy:] = data[:, :1]
+        outdata[:] = (mono * float(self.mic_volume))[:, None]
 
     def _open_mic_stream(self) -> None:
-        if sd is None:
-            raise RuntimeError("sounddevice no esta disponible en este entorno.")
-
         input_index, output_index = self._selected_device_pair()
-        if input_index is None or output_index is None:
-            raise ValueError("No se pudo resolver el dispositivo de entrada o salida para el microfono.")
-
         input_device = sd.query_devices(input_index)
         output_device = sd.query_devices(output_index)
         if int(input_device.get("hostapi", -1)) != int(output_device.get("hostapi", -1)):
@@ -996,8 +897,11 @@ class soundMotor:
                 f"Los dispositivos seleccionados usan host APIs distintas: entrada={input_device.get('hostapi')} salida={output_device.get('hostapi')}."
             )
 
-        input_channels = max(1, int(input_device.get("max_input_channels", 1)))
-        output_channels = max(1, int(output_device.get("max_output_channels", 2)))
+        # Basta con 2 canales: CABLE Input reporta hasta 16 en MME y abrirlos todos
+        # solo duplica la voz en canales que Discord ignora.
+        input_channels = max(1, min(2, int(input_device.get("max_input_channels", 1))))
+        output_channels = max(1, min(2, int(output_device.get("max_output_channels", 2))))
+        self.mic_processor = MicProcessor(self.sample_rate, self.mic_filter_settings)
 
         self.mic_stream = sd.Stream(
             device=(input_index, output_index),
@@ -1023,11 +927,13 @@ class soundMotor:
                 finally:
                     self.mic_stream = None
             self.mic_active = False
+            self.mic_error = str(error)
             if hasattr(self.config_manager, "updateConfig"):
                 self.config_manager.updateConfig({"mic_active": False})
             print(f"No se pudo iniciar el microfono: {error}")
             return False
 
+        self.mic_error = None
         self.mic_active = True
         if hasattr(self.config_manager, "updateConfig"):
             self.config_manager.updateConfig({"mic_active": True})
@@ -1035,12 +941,74 @@ class soundMotor:
 
     def stop_mic(self) -> None:
         if self.mic_stream is not None:
-            self.mic_stream.stop()
-            self.mic_stream.close()
-            self.mic_stream = None
+            try:
+                self.mic_stream.stop()
+            finally:
+                self.mic_stream.close()
+                self.mic_stream = None
         self.mic_active = False
         if hasattr(self.config_manager, "updateConfig"):
             self.config_manager.updateConfig({"mic_active": False})
+
+    def update_mic_filter(self, current_config: dict[str, Any]) -> None:
+        self.mic_filter_settings = MicFilterSettings.from_config(current_config)
+        if self.mic_processor is not None:
+            self.mic_processor.update_settings(self.mic_filter_settings)
+        self.ducking_enabled = bool(current_config.get("mic_ducking", True))
+        self.ducking_level = max(0.0, min(1.0, float(current_config.get("mic_ducking_level", 0.4))))
+
+    @property
+    def playback_warning(self) -> str | None:
+        return singleSoundHandler.fallback_warning
+
+    def is_voice_active(self) -> bool:
+        processor = self.mic_processor
+        return bool(self.mic_active and processor is not None and processor.voice_detected)
+
+    def tick(self) -> None:
+        """Llamar periodicamente (~50 ms) desde la UI: loop de musica y ducking."""
+        now = time.monotonic()
+        dt = 0.05 if self._last_tick is None else min(0.5, now - self._last_tick)
+        self._last_tick = now
+
+        self.music.tick()
+
+        target = self.ducking_level if self.ducking_enabled and self.is_voice_active() else 1.0
+        # Baja rapido al empezar a hablar (~60 ms) y vuelve suave al callar (~400 ms).
+        time_constant = 0.06 if target < self._duck_gain else 0.4
+        self._duck_gain += (target - self._duck_gain) * (1.0 - math.exp(-dt / time_constant))
+        if abs(self._duck_gain - target) < 0.005:
+            self._duck_gain = target
+        for handler in (self.music, self.sfx):
+            if abs(handler.duck_gain - self._duck_gain) > 0.001:
+                handler.set_duck_gain(self._duck_gain)
+
+    def release_portaudio_streams(self) -> bool:
+        """Cierra todo stream de sounddevice (para re-escanear dispositivos). Devuelve si el mic estaba activo."""
+        mic_was_active = self.mic_active
+        self.stop_mic()
+        self.music._mirror.stop()
+        self.sfx._mirror.stop()
+        return mic_was_active
+
+    def shutdown(self) -> None:
+        self.stop_mic()
+        self.music.stop()
+        self.sfx.stop()
+        if pygame is not None and pygame.mixer.get_init():
+            pygame.mixer.quit()
+
+    def get_mic_levels(self) -> dict[str, Any] | None:
+        processor = self.mic_processor
+        if processor is None or not self.mic_active:
+            return None
+        return {
+            "input_db": processor.input_level_db,
+            "output_db": processor.output_level_db,
+            "gate_open": processor.gate_open,
+            "voice": processor.voice_detected,
+            "duck_gain": self._duck_gain,
+        }
 
     def set_music_source(self, sound_file: str | Path | None) -> None:
         self.music_source = Path(sound_file) if sound_file is not None else None
@@ -1117,6 +1085,7 @@ class soundMotor:
         self.buffer_size = int(self.config.get("buffer_size", 1024))
         self.mic_volume = float(self.config.get("volume_mic", 1.0))
         self.monitor_audio = bool(self.config.get("monitor_audio", False))
+        self.update_mic_filter(self.config)
 
         output_device = self.config.get("output_device") or self.config.get("default_output_device")
         monitor_output_device = self.config.get("monitor_output_device") or output_device
