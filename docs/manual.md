@@ -22,13 +22,31 @@ El audio viaja así:
    - Desactiva **Supresión de ruido**, **Cancelación de eco** y **Control automático de ganancia**. El filtro de esta app ya limpia tu voz, y los de Discord cortan la música.
    - En **Sensibilidad de entrada**, baja el umbral para que la música no se corte cuando no hablas, o usa pulsar para hablar.
 
-## Música y efectos
+## Biblioteca y carpetas
 
-- **Agregar música / Agregar efecto** copia un MP3 a tu biblioteca.
-- Cada pista tiene botones de **reproducir**, **pausar** y **detener**.
-- En la pestaña **Música**, arrastra la barra de progreso para saltar a otra parte de la canción. La pista activa se marca con un borde morado.
-- **Loop música / Loop SFX** (en Config) hace que se repitan.
+- **Agregar música / Agregar efecto** copia uno o varios archivos (MP3, WAV, OGG o FLAC) a tu biblioteca, dentro de la carpeta elegida.
+- Organiza la música y los efectos en **carpetas**: con **Nueva carpeta** creas una (por ejemplo "Tranquila", "Batalla" o "Risas") y con el selector **Carpeta** eliges cuál ver. "Todas" muestra todo; "General" muestra solo los archivos sueltos.
+- **Abrir carpeta** abre la carpeta elegida en el Explorador de Windows, por si quieres ordenar archivos a mano. Después pulsa **Actualizar biblioteca**.
+- El botón rojo con papelera de cada fila envía ese archivo a la **Papelera de reciclaje**. Si te equivocas, lo puedes recuperar desde ahí.
 - Usa el **Filtro** para buscar por nombre.
+- Al pasar el mouse sobre los botones redondos aparece qué hace cada uno.
+
+## Música
+
+- Cada pista tiene botones de **reproducir**, **pausar** y **detener**. La pista que suena se marca con un borde morado.
+- Arrastra la barra de progreso para saltar a otra parte de la canción.
+- **Al terminar** define qué pasa cuando acaba una pista:
+  - **Lista en ciclo**: sigue con la próxima de la carpeta elegida y, al llegar al final, vuelve a empezar.
+  - **Aleatorio**: sigue con otra pista al azar de la carpeta.
+  - **Repetir pista**: repite la misma canción.
+  - **Una vez**: se detiene.
+
+## Efectos
+
+- **Reproducir** (azul) toca el efecto **una vez**. Puedes pulsarlo varias veces: los efectos se superponen sin cortarse entre sí ni cortar la música.
+- **Loop** (flechas circulares) lo deja sonando en bucle; el botón se vuelve morado mientras está activo. Púlsalo de nuevo para detener ese loop.
+- **Detener** (morado) detiene solo ese efecto.
+- **Asignar atajo** le da a cada efecto su propia combinación de teclas, que funciona aunque la ventana esté minimizada. En el mismo diálogo puedes **quitar el atajo**. Si la combinación ya la usa otro atajo, la app te avisa.
 
 ## Micrófono y filtro nativo
 
@@ -54,16 +72,20 @@ Funcionan aunque la ventana esté minimizada. Se editan en la pestaña **Atajos*
 - Play música: `Ctrl+Alt+Shift+P`
 - Stop música: `Ctrl+Alt+Shift+O`
 - Pausa música: `Ctrl+Alt+Shift+I`
-- Play SFX: `Ctrl+Alt+Shift+E`
-- Stop SFX: `Ctrl+Alt+Shift+W`
+- Música siguiente: `Ctrl+Alt+Shift+N`
+- Play SFX (el último efecto usado, una vez): `Ctrl+Alt+Shift+E`
+- SFX siguiente (recorre la carpeta elegida): `Ctrl+Alt+Shift+D`
+- Stop SFX (todos, incluidos los loops): `Ctrl+Alt+Shift+W`
 - Pausa SFX: `Ctrl+Alt+Shift+Q`
 - Guardar ajustes: `Ctrl+Alt+Shift+S`
+
+Además, cada efecto puede tener su propio atajo (pestaña **Efectos > Asignar atajo**).
 
 Si otra app ya usa una combinación, la app te avisa y puedes elegir otra.
 
 ## Escucharte (monitor)
 
-**Escucharme localmente** duplica la música y los SFX en la **Salida monitor** (por ejemplo, tus audífonos), para que escuches lo mismo que tus amigos.
+**Escucharme localmente** duplica la música y los SFX en la **Salida monitor** (por ejemplo, tus audífonos), para que escuches lo mismo que tus amigos. Puedes cambiar la salida monitor mientras suena algo: la música sigue en el nuevo dispositivo y el anterior deja de sonar.
 
 ## Dónde se guardan tus datos
 

@@ -17,6 +17,8 @@ DEFAULT_HOTKEYS: dict[str, str] = {
     "play_sfx": "Ctrl+Alt+Shift+E",
     "stop_sfx": "Ctrl+Alt+Shift+W",
     "pause_sfx": "Ctrl+Alt+Shift+Q",
+    "next_music": "Ctrl+Alt+Shift+N",
+    "next_sfx": "Ctrl+Alt+Shift+D",
     "save_settings": "Ctrl+Alt+Shift+S",
 }
 
@@ -63,6 +65,13 @@ class configHandler:
             "mic_ducking_level": 0.4,
             "skip_cable_check": False,
             "ui_sounds": True,
+            # playlist | shuffle | repeat_one | once
+            "music_mode": "playlist",
+            # Carpeta elegida en cada pestaña ("Todas", "General" o la ruta relativa).
+            "music_folder": "Todas",
+            "sfx_folder": "Todas",
+            # Atajo propio de cada efecto: {ruta relativa dentro de sfx: "Ctrl+Alt+1"}.
+            "sfx_hotkeys": {},
             "hotkeys": dict(DEFAULT_HOTKEYS),
         }
 
@@ -111,6 +120,14 @@ class configHandler:
         merged["mic_ducking_level"] = self._clamp_float(merged.get("mic_ducking_level", 0.4))
         merged["skip_cable_check"] = bool(merged.get("skip_cable_check", False))
         merged["ui_sounds"] = bool(merged.get("ui_sounds", True))
+        if merged.get("music_mode") not in ("playlist", "shuffle", "repeat_one", "once"):
+            merged["music_mode"] = "playlist"
+        merged["music_folder"] = str(merged.get("music_folder") or "Todas")
+        merged["sfx_folder"] = str(merged.get("sfx_folder") or "Todas")
+        sfx_hotkeys = merged.get("sfx_hotkeys")
+        merged["sfx_hotkeys"] = {
+            str(key): str(spec) for key, spec in (sfx_hotkeys.items() if isinstance(sfx_hotkeys, dict) else []) if str(spec).strip()
+        }
         return merged
 
     def readConfig(self, config_path: Path | str | None = None) -> dict[str, Any]:

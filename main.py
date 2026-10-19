@@ -11,24 +11,24 @@ from __future__ import annotations
 import ctypes
 import logging
 import queue
+import random
 import re
 import os
 import shutil
 import sys
 import threading
 import webbrowser
-from dataclasses import dataclass
 from ctypes import wintypes
 from pathlib import Path
 from typing import Any, Callable
 
 import sounddevice as sd
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter import font as tkfont
 
 from appinfo import APP_NAME, APP_VERSION
-from logic import errorLog, uiTheme
+from logic import errorLog, library, uiTheme
 from logic.congifHandler import DEFAULT_HOTKEYS, configHandler
 from logic.soundMotor import resolve_device, soundMotor
 from logic.uiSounds import UiSounds
@@ -55,7 +55,6 @@ CONFIG_DIR = DATA_DIR / "config"
 VISUAL_DIR = RESOURCE_DIR / "visual"
 DOCS_DIR = RESOURCE_DIR / "docs"
 LOG_DIR = DATA_DIR / "logs"
-TRACK_EXTENSIONS = {".mp3"}
 
 log = logging.getLogger("astrados")
 
@@ -93,9 +92,11 @@ HOTKEY_ACTIONS: dict[str, tuple[str, str]] = {
     "play_music": ("Play musica", "Reproduce la musica marcada o la primera disponible"),
     "stop_music": ("Stop musica", "Detiene la musica actual"),
     "pause_music": ("Pause musica", "Pausa o reanuda la musica actual"),
-    "play_sfx": ("Play SFX", "Reproduce el SFX marcado o el primero disponible"),
-    "stop_sfx": ("Stop SFX", "Detiene el SFX actual"),
-    "pause_sfx": ("Pause SFX", "Pausa o reanuda el SFX actual"),
+    "next_music": ("Musica siguiente", "Pasa a la siguiente pista de la carpeta elegida"),
+    "play_sfx": ("Play SFX", "Reproduce una vez el ultimo efecto usado (o el primero)"),
+    "next_sfx": ("SFX siguiente", "Reproduce el siguiente efecto de la carpeta elegida"),
+    "stop_sfx": ("Stop SFX", "Detiene todos los efectos (tambien los que estan en loop)"),
+    "pause_sfx": ("Pause SFX", "Pausa o reanuda todos los efectos"),
     "save_settings": ("Guardar ajustes", "Guarda la configuracion local en disco"),
 }
 
@@ -104,30 +105,12 @@ def default_hotkeys() -> dict[str, str]:
     return dict(DEFAULT_HOTKEYS)
 
 
-@dataclass(frozen=True)
-class AudioAsset:
-    category: str
-    path: Path
-
-    @property
-    def name(self) -> str:
-        return self.path.stem
+AudioAsset = library.AudioAsset
 
 
 def ensure_project_directories() -> None:
     for folder in (DATA_DIR, MUSIC_DIR, SFX_DIR, RECORDINGS_DIR, CONFIG_DIR, LOG_DIR):
         folder.mkdir(parents=True, exist_ok=True)
-
-
-def scan_local_assets(folder: Path, category: str) -> list[AudioAsset]:
-    assets: list[AudioAsset] = []
-    if not folder.exists():
-        return assets
-
-    for path in sorted(folder.glob("**/*")):
-        if path.is_file() and path.suffix.lower() in TRACK_EXTENSIONS:
-            assets.append(AudioAsset(category=category, path=path))
-    return assets
 
 
 def format_device_label(index: int, device: dict[str, Any], hostapi_name: str | None = None) -> str:
@@ -256,7 +239,7 @@ def center_over(window: tk.Toplevel, parent: tk.Misc) -> None:
 
 
 class HotkeyCaptureDialog(tk.Toplevel):
-    def __init__(self, parent: tk.Misc, label: str, current_value: str) -> None:
+    def __init__(self, parent: tk.Misc, label: str, current_value: str, allow_clear: bool = False) -> None:
         super().__init__(parent)
         self.result: str | None = None
         self.configure(bg=uiTheme.PAGE_BG)
@@ -274,7 +257,11 @@ class HotkeyCaptureDialog(tk.Toplevel):
         ttk.Label(body, text=f"Pulsa la combinacion para {label}", style="CardBold.TLabel").pack(anchor="w")
         ttk.Label(body, text="Se guardara al presionar una tecla valida. Escape cancela.", style="CardMuted.TLabel").pack(anchor="w", pady=(4, 12))
         ttk.Label(body, textvariable=self.status_var, style="Meter.TLabel").pack(anchor="w", pady=(0, 12))
-        ttk.Button(body, text="Cancelar", style="Light.TButton", command=self._cancel).pack(anchor="e")
+        buttons = ttk.Frame(body, style="Card.TFrame")
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="Cancelar", style="Light.TButton", command=self._cancel).pack(side="right")
+        if allow_clear and current_value:
+            ttk.Button(buttons, text="Quitar atajo", style="Light.TButton", command=self._clear).pack(side="right", padx=6)
 
         self.bind("<KeyPress>", self._on_key_press)
         self.bind("<Escape>", self._cancel)
@@ -291,6 +278,10 @@ class HotkeyCaptureDialog(tk.Toplevel):
 
     def _cancel(self, _event: tk.Event | None = None) -> None:
         self.result = None
+        self.destroy()
+
+    def _clear(self) -> None:
+        self.result = ""  # cadena vacia = quitar el atajo
         self.destroy()
 
 
@@ -515,178 +506,285 @@ class DocumentView(ttk.Frame):
         text.see("end")
 
 
+MUSIC_MODE_LABELS = {
+    "playlist": "Lista en ciclo",
+    "shuffle": "Aleatorio",
+    "repeat_one": "Repetir pista",
+    "once": "Una vez",
+}
+
+
 class AudioLibraryPanel(ttk.Frame):
+    """Lista de musica o efectos con carpetas, filtro y acciones por fila.
+
+    `actions` es la app: el panel solo dibuja y delega (play, loop, borrar, atajos...).
+    """
+
     def __init__(
         self,
         parent: tk.Widget,
-        theme: uiTheme.Theme,
+        app: "AudioHandlerApp",
+        kind: str,
         title: str,
         description: str,
         icon: str,
-        show_progress: bool = False,
+        root_dir: Path,
     ) -> None:
         super().__init__(parent, padding=(16, 14, 16, 8))
-        self.theme = theme
+        self.app = app
+        self.theme = app.theme
+        self.kind = kind
+        self.is_music = kind == "music"
         self.title = title
         self.description = description
         self.icon = icon
-        self.show_progress = show_progress
-        self.assets: list[AudioAsset] = []
-        self.play_handler: Callable[[AudioAsset], None] | None = None
-        self.pause_handler: Callable[[], None] | None = None
-        self.stop_handler: Callable[[], None] | None = None
-        self.seek_handler: Callable[[AudioAsset, float], None] | None = None
+        self.root_dir = root_dir
+        self.assets: list[library.AudioAsset] = []
         self.search_var = tk.StringVar(value="")
+        self.folder_var = tk.StringVar(value=app.config_manager.as_dict().get(f"{kind}_folder", library.ALL_CATEGORIES))
+        self.mode_var = tk.StringVar(value=MUSIC_MODE_LABELS.get(app.config_manager.as_dict().get("music_mode"), "Lista en ciclo"))
         self._row_state: dict[Path, dict[str, Any]] = {}
-
         self._build()
 
+    # ------------------------------------------------------------------ construccion
     def _build(self) -> None:
+        images = self.theme.images
         heading = ttk.Frame(self)
         heading.pack(fill="x")
-        ttk.Label(heading, text=f"  {self.title}", image=self.theme.image(self.icon), compound="left", style="Title.TLabel").pack(side="left")
+        ttk.Label(heading, text=f"  {self.title}", image=images[self.icon], compound="left", style="Title.TLabel").pack(side="left")
 
-        search_bar = ttk.Frame(heading)
-        search_bar.pack(side="right")
-        ttk.Label(search_bar, text="Filtro:").pack(side="left", padx=(0, 6))
-        ttk.Entry(search_bar, textvariable=self.search_var, width=32).pack(side="left")
+        ttk.Button(heading, text=" Abrir carpeta", image=images["icon_folder-open_dark"], compound="left",
+                   style="Light.TButton", command=self._open_folder).pack(side="right")
+        ttk.Button(heading, text=" Nueva carpeta", image=images["icon_folder-plus_dark"], compound="left",
+                   style="Light.TButton", command=self._new_folder).pack(side="right", padx=6)
+        self.folder_combo = ttk.Combobox(heading, textvariable=self.folder_var, state="readonly", width=22)
+        self.folder_combo.pack(side="right", padx=(6, 0))
+        self.folder_combo.bind("<<ComboboxSelected>>", lambda _event: self._on_folder_changed())
+        ttk.Label(heading, text="Carpeta:").pack(side="right")
+
+        options = ttk.Frame(self)
+        options.pack(fill="x", pady=(4, 10))
+        ttk.Label(options, text=self.description, style="Muted.TLabel").pack(side="left")
+        ttk.Entry(options, textvariable=self.search_var, width=26).pack(side="right")
+        ttk.Label(options, text="Filtro:").pack(side="right", padx=(12, 6))
+        if self.is_music:
+            mode_combo = ttk.Combobox(options, textvariable=self.mode_var, state="readonly", width=16,
+                                      values=list(MUSIC_MODE_LABELS.values()))
+            mode_combo.pack(side="right")
+            mode_combo.bind("<<ComboboxSelected>>", lambda _event: self.app.set_music_mode(self.music_mode()))
+            ttk.Label(options, text="Al terminar:").pack(side="right", padx=(12, 6))
         self.search_var.trace_add("write", lambda *_: self._render())
-
-        ttk.Label(self, text=self.description, style="Muted.TLabel").pack(anchor="w", pady=(2, 10))
 
         self.scroller = ScrollableFrame(self)
         self.scroller.pack(fill="both", expand=True)
         self.content = self.scroller.inner
 
-    def set_assets(self, assets: list[AudioAsset]) -> None:
+    def music_mode(self) -> str:
+        label = self.mode_var.get()
+        return next((mode for mode, text in MUSIC_MODE_LABELS.items() if text == label), "playlist")
+
+    # ------------------------------------------------------------------ datos
+    def set_assets(self, assets: list[library.AudioAsset]) -> None:
         self.assets = list(assets)
+        folders = [library.ALL_CATEGORIES, library.ROOT_CATEGORY] + library.list_folders(self.root_dir)
+        self.folder_combo["values"] = folders
+        if self.folder_var.get() not in folders:
+            self.folder_var.set(library.ALL_CATEGORIES)
         self._render()
 
-    def set_play_handler(self, handler: Callable[[AudioAsset], None]) -> None:
-        self.play_handler = handler
+    def selected_folder(self) -> str | None:
+        return library.folder_from_label(self.folder_var.get())
 
-    def set_action_handlers(
-        self,
-        play_handler: Callable[[AudioAsset], None] | None = None,
-        pause_handler: Callable[[], None] | None = None,
-        stop_handler: Callable[[], None] | None = None,
-    ) -> None:
-        self.play_handler = play_handler
-        self.pause_handler = pause_handler
-        self.stop_handler = stop_handler
+    def target_dir(self) -> Path:
+        """Carpeta donde se copian los archivos nuevos: la elegida (o la raiz si es "Todas")."""
+        folder = self.selected_folder()
+        return self.root_dir / folder if folder else self.root_dir
 
-    def set_seek_handler(self, handler: Callable[[AudioAsset, float], None] | None) -> None:
-        self.seek_handler = handler
+    def visible_assets(self) -> list[library.AudioAsset]:
+        """Lo que se ve en la lista; tambien define el orden de la lista de reproduccion."""
+        return library.filter_assets(self.assets, self.selected_folder(), self.search_var.get())
 
-    def update_progress(
-        self,
-        asset: AudioAsset | None,
-        current_seconds: float,
-        duration_seconds: float,
-        is_playing: bool,
-        is_paused: bool,
-    ) -> None:
+    def _on_folder_changed(self) -> None:
+        self.app.config_manager.updateConfig({f"{self.kind}_folder": self.folder_var.get()})
+        self._render()
+
+    def _open_folder(self) -> None:
+        folder = self.target_dir()
+        folder.mkdir(parents=True, exist_ok=True)
+        os.startfile(folder)
+
+    def _new_folder(self) -> None:
+        name = simpledialog.askstring("Nueva carpeta", "Nombre de la carpeta:", parent=self.winfo_toplevel())
+        if not name:
+            return
+        try:
+            created = library.create_folder(self.root_dir, name)
+        except (ValueError, OSError) as error:
+            self.app.ui_sounds.play("error")
+            messagebox.showerror("Nueva carpeta", str(error), parent=self.winfo_toplevel())
+            return
+        self.app.ui_sounds.play("confirm")
+        self.app.refresh_library()
+        self.folder_var.set(created.relative_to(self.root_dir).as_posix())
+        self._on_folder_changed()
+        self.app._set_status(f"Carpeta creada: {created.name}. Los archivos que agregues iran ahi.")
+
+    # ------------------------------------------------------------------ estado en vivo
+    def update_music_state(self, asset: library.AudioAsset | None, current_seconds: float, duration_seconds: float,
+                           is_playing: bool, is_paused: bool) -> None:
         active_path = asset.path if asset is not None else None
         for path, state in self._row_state.items():
-            is_active = active_path is not None and path == active_path and (is_playing or is_paused)
-            state["row"].configure(highlightbackground=uiTheme.PURPLE if is_active else uiTheme.BORDER,
-                                   highlightthickness=2 if is_active else 1)
-            if not self.show_progress or state.get("dragging"):
+            is_active = path == active_path and (is_playing or is_paused)
+            self._highlight(state, is_active)
+            if state.get("dragging"):
                 continue
-
-            progress_var = state["progress_var"]
-            time_var = state["time_var"]
             if not is_active or duration_seconds <= 0:
-                progress_var.set(0.0)
-                time_var.set("0:00 / 0:00")
+                state["progress_var"].set(0.0)
+                state["time_var"].set("0:00 / 0:00")
                 continue
+            state["progress_var"].set(max(0.0, min(100.0, current_seconds / duration_seconds * 100.0)))
+            state["time_var"].set(f"{self._format_time(current_seconds)} / {self._format_time(duration_seconds)}")
 
-            percentage = max(0.0, min(100.0, (current_seconds / duration_seconds) * 100.0))
-            progress_var.set(percentage)
-            time_var.set(f"{self._format_time(current_seconds)} / {self._format_time(duration_seconds)}")
+    def update_sfx_state(self, active: set[Path], looping: set[Path]) -> None:
+        for path, state in self._row_state.items():
+            self._highlight(state, path in active)
+            is_looping = path in looping
+            if state.get("looping") != is_looping:
+                state["looping"] = is_looping
+                state["loop_button"].configure(image=self.theme.button_images("orb_loop_on" if is_looping else "orb_loop"))
+
+    def refresh_hotkey_labels(self) -> None:
+        for state in self._row_state.values():
+            if "hotkey_button" in state:
+                state["hotkey_button"].configure(text=self._hotkey_text(state["asset"]))
+
+    def _highlight(self, state: dict[str, Any], active: bool) -> None:
+        if state.get("active") == active:
+            return
+        state["active"] = active
+        state["row"].configure(highlightbackground=uiTheme.PURPLE if active else uiTheme.BORDER,
+                               highlightthickness=2 if active else 1)
 
     def _format_time(self, seconds: float) -> str:
-        total_seconds = max(0, int(seconds))
-        minutes, remaining_seconds = divmod(total_seconds, 60)
-        return f"{minutes}:{remaining_seconds:02d}"
+        minutes, remaining = divmod(max(0, int(seconds)), 60)
+        return f"{minutes}:{remaining:02d}"
 
+    def _hotkey_text(self, asset: library.AudioAsset) -> str:
+        spec = self.app.sfx_hotkey_for(asset)
+        return f" {spec}" if spec else " Asignar atajo"
+
+    # ------------------------------------------------------------------ filas
     def _render(self) -> None:
         for child in self.content.winfo_children():
             child.destroy()
         self._row_state.clear()
 
-        filter_text = self.search_var.get().strip().lower()
-        filtered_assets = [
-            asset for asset in self.assets
-            if not filter_text or filter_text in asset.path.name.lower() or filter_text in asset.path.stem.lower()
-        ]
-
-        if not filtered_assets:
+        visible = self.visible_assets()
+        if not visible:
             empty = uiTheme.card(self.content)
             empty.pack(fill="x", pady=6)
-            ttk.Label(empty, text="No hay archivos para mostrar. Usa los botones de arriba para agregar MP3.",
-                      style="CardMuted.TLabel", padding=16).pack(anchor="w")
+            hint = "No hay archivos en esta carpeta." if self.assets else "Todavia no hay archivos. Usa los botones de arriba para agregar audio."
+            ttk.Label(empty, text=hint, style="CardMuted.TLabel", padding=16).pack(anchor="w")
             return
 
-        for asset in filtered_assets:
+        px = self.theme.px
+        for asset in visible:
             row = uiTheme.card(self.content)
             row.pack(fill="x", pady=4, padx=(0, 6))
-            row.columnconfigure(0, minsize=self.theme.px(260))
+            row.columnconfigure(0, minsize=px(260))
             row.columnconfigure(1, weight=1)
 
             text_frame = ttk.Frame(row, style="Card.TFrame")
             text_frame.grid(row=0, column=0, sticky="w", padx=(14, 10), pady=10)
-            ttk.Label(text_frame, text=asset.path.stem, style="CardBold.TLabel").pack(anchor="w")
-            ttk.Label(text_frame, text=f"{asset.path.parent.name}  -  {asset.path.suffix[1:].upper()}", style="CardMuted.TLabel").pack(anchor="w")
+            ttk.Label(text_frame, text=asset.name, style="CardBold.TLabel").pack(anchor="w")
+            ttk.Label(text_frame, text=f"{library.folder_label(asset.folder)}  -  {asset.path.suffix[1:].upper()}",
+                      style="CardMuted.TLabel").pack(anchor="w")
 
-            progress_var = tk.DoubleVar(value=0.0)
-            time_var = tk.StringVar(value="0:00 / 0:00")
-            state: dict[str, Any] = {"row": row, "progress_var": progress_var, "time_var": time_var, "dragging": False}
-            if self.show_progress:
-                progress_frame = ttk.Frame(row, style="Card.TFrame")
-                progress_frame.grid(row=0, column=1, sticky="ew", padx=8, pady=10)
-                progress_frame.columnconfigure(0, weight=1)
-                scale = ttk.Scale(progress_frame, from_=0, to=100, orient="horizontal", variable=progress_var)
+            state: dict[str, Any] = {"row": row, "asset": asset, "active": False}
+            middle = ttk.Frame(row, style="Card.TFrame")
+            middle.grid(row=0, column=1, sticky="ew", padx=8, pady=10)
+            middle.columnconfigure(0, weight=1)
+            actions = ttk.Frame(row, style="Card.TFrame")
+            actions.grid(row=0, column=2, sticky="e", padx=(8, 12), pady=8)
+
+            if self.is_music:
+                state.update(progress_var=tk.DoubleVar(value=0.0), time_var=tk.StringVar(value="0:00 / 0:00"), dragging=False)
+                scale = ttk.Scale(middle, from_=0, to=100, orient="horizontal", variable=state["progress_var"])
                 scale.grid(row=0, column=0, sticky="ew")
                 # Mientras se arrastra no se pisa la posicion con el refresco periodico.
                 scale.bind("<ButtonPress-1>", lambda _event, current=state: current.update(dragging=True))
-                scale.bind(
-                    "<ButtonRelease-1>",
-                    lambda _event, current_asset=asset, current=state: self._end_drag(current_asset, current),
+                scale.bind("<ButtonRelease-1>", lambda _event, current=state: self._end_drag(current))
+                ttk.Label(middle, textvariable=state["time_var"], style="CardMuted.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 0))
+                buttons = (
+                    ("orb_play", "Reproducir", lambda current=asset: self.app.play_music_asset(current)),
+                    ("orb_pause", "Pausar / reanudar", self.app.toggle_music_pause),
+                    ("orb_stop", "Detener", self.app.stop_music),
                 )
-                ttk.Label(progress_frame, textvariable=time_var, style="CardMuted.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 0))
+            else:
+                hotkey_button = ttk.Button(middle, text=self._hotkey_text(asset), style="Light.TButton",
+                                           image=self.theme.image("icon_bolt_dark"), compound="left",
+                                           command=lambda current=asset: self.app.capture_sfx_hotkey(current))
+                hotkey_button.grid(row=0, column=0, sticky="w")
+                state["hotkey_button"] = hotkey_button
+                state["looping"] = False
+                buttons = (
+                    ("orb_play", "Reproducir una vez", lambda current=asset: self.app.play_sfx_asset(current)),
+                    ("orb_loop", "Loop (activar / desactivar)", lambda current=asset: self.app.toggle_sfx_loop(current)),
+                    ("orb_stop", "Detener este efecto", lambda current=asset: self.app.stop_sfx(current)),
+                )
 
-            action_frame = ttk.Frame(row, style="Card.TFrame")
-            action_frame.grid(row=0, column=2, sticky="e", padx=(8, 12), pady=8)
-            for orb_name, command in (
-                ("orb_play", lambda current_asset=asset: self._play(current_asset)),
-                ("orb_pause", self._pause),
-                ("orb_stop", self._stop),
-            ):
-                ttk.Button(action_frame, image=self.theme.button_images(orb_name), style="Orb.TButton",
-                           command=command, cursor="hand2", takefocus=False).pack(side="left", padx=2)
+            for image_name, tooltip, command in buttons:
+                button = ttk.Button(actions, image=self.theme.button_images(image_name), style="Orb.TButton",
+                                    command=command, cursor="hand2", takefocus=False)
+                button.pack(side="left", padx=2)
+                Tooltip(button, tooltip)
+                if image_name == "orb_loop":
+                    state["loop_button"] = button
+            delete_button = ttk.Button(actions, image=self.theme.button_images("orb_delete"), style="Orb.TButton",
+                                       command=lambda current=asset: self.app.delete_asset(current), cursor="hand2", takefocus=False)
+            delete_button.pack(side="left", padx=(10, 0))
+            Tooltip(delete_button, "Enviar a la papelera")
 
             self._row_state[asset.path] = state
 
-    def _end_drag(self, asset: AudioAsset, state: dict[str, Any]) -> None:
+    def _end_drag(self, state: dict[str, Any]) -> None:
         state["dragging"] = False
-        self._seek(asset, float(state["progress_var"].get()))
+        self.app.seek_music_asset(state["asset"], max(0.0, min(100.0, float(state["progress_var"].get()))))
 
-    def _play(self, asset: AudioAsset) -> None:
-        if self.play_handler is not None:
-            self.play_handler(asset)
 
-    def _pause(self) -> None:
-        if self.pause_handler is not None:
-            self.pause_handler()
+class Tooltip:
+    """Texto de ayuda al pasar el mouse (los botones redondos no tienen texto)."""
 
-    def _stop(self) -> None:
-        if self.stop_handler is not None:
-            self.stop_handler()
+    def __init__(self, widget: tk.Widget, text: str) -> None:
+        self.widget = widget
+        self.text = text
+        self.window: tk.Toplevel | None = None
+        self._after: str | None = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
 
-    def _seek(self, asset: AudioAsset, percentage: float) -> None:
-        if self.seek_handler is not None:
-            self.seek_handler(asset, max(0.0, min(100.0, percentage)))
+    def _schedule(self, _event: tk.Event) -> None:
+        self._after = self.widget.after(450, self._show)
+
+    def _show(self) -> None:
+        if self.window is not None:
+            return
+        x = self.widget.winfo_rootx() + self.widget.winfo_width() // 2
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self.window = tk.Toplevel(self.widget)
+        self.window.wm_overrideredirect(True)
+        self.window.wm_geometry(f"+{x}+{y}")
+        tk.Label(self.window, text=self.text, bg=uiTheme.CARD_BG, fg=uiTheme.TEXT, font=(uiTheme.FONT, 9),
+                 highlightthickness=1, highlightbackground=uiTheme.BORDER, padx=6, pady=2).pack()
+
+    def _hide(self, _event: tk.Event | None = None) -> None:
+        if self._after is not None:
+            self.widget.after_cancel(self._after)
+            self._after = None
+        if self.window is not None:
+            self.window.destroy()
+            self.window = None
 
 
 class AudioHandlerApp:
@@ -725,8 +823,6 @@ class AudioHandlerApp:
         }
         self.bool_vars = {
             "mic_active": tk.BooleanVar(value=self.config_manager.mic_active()),
-            "loop_music": tk.BooleanVar(value=self.config_manager.loop_music()),
-            "loop_sfx": tk.BooleanVar(value=self.config_manager.loop_sfx()),
             "monitor_audio": tk.BooleanVar(value=bool(self.config_manager.as_dict().get("monitor_audio", False))),
             "mic_noise_suppression": tk.BooleanVar(value=bool(self.config_manager.as_dict().get("mic_noise_suppression", False))),
             "mic_noise_gate": tk.BooleanVar(value=bool(self.config_manager.as_dict().get("mic_noise_gate", False))),
@@ -811,8 +907,10 @@ class AudioHandlerApp:
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill="both", expand=True, padx=16, pady=(6, 8))
 
-        self.music_panel = AudioLibraryPanel(self.notebook, self.theme, "Musica", "Pistas locales que suenan en loop de fondo.", "icon_musical-note", show_progress=True)
-        self.sfx_panel = AudioLibraryPanel(self.notebook, self.theme, "Efectos", "Sonidos disparados por evento, sin silenciar las otras fuentes.", "icon_sparkles")
+        self.music_panel = AudioLibraryPanel(self.notebook, self, "music", "Musica",
+                                             "Musica de fondo: al terminar una pista sigue con la proxima.", "icon_musical-note", MUSIC_DIR)
+        self.sfx_panel = AudioLibraryPanel(self.notebook, self, "sfx", "Efectos",
+                                           "Cada efecto suena una vez o en loop, y pueden sonar varios a la vez.", "icon_sparkles", SFX_DIR)
         self.hotkeys_tab = self._build_hotkeys_tab(self.notebook)
         self.config_tab = self._build_config_tab(self.notebook)
         self.engine_tab = self._build_engine_tab(self.notebook)
@@ -829,9 +927,6 @@ class AudioHandlerApp:
             self.notebook.add(widget, text=f" {text}", image=images[icon], compound="left")
         self.notebook.bind("<<NotebookTabChanged>>", lambda _event: self._ui_ready and self.ui_sounds.play("click"))
 
-        self.music_panel.set_action_handlers(self.play_music_asset, self.toggle_music_pause, self.stop_music)
-        self.music_panel.set_seek_handler(self.seek_music_asset)
-        self.sfx_panel.set_action_handlers(self.play_sfx_asset, self.toggle_sfx_pause, self.stop_sfx)
 
     def _build_header(self) -> None:
         images = self.theme.images
@@ -961,8 +1056,6 @@ class AudioHandlerApp:
         switches.grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
         for index, (key, text) in enumerate((
             ("mic_active", "Microfono activo"),
-            ("loop_music", "Loop musica"),
-            ("loop_sfx", "Loop SFX"),
             ("monitor_audio", "Escucharme localmente (monitor)"),
         )):
             ttk.Checkbutton(switches, text=text, variable=self.bool_vars[key]).grid(row=index // 2, column=index % 2, sticky="w", padx=(0, 24))
@@ -1177,8 +1270,8 @@ class AudioHandlerApp:
         self.status_text.set(message)
 
     def refresh_library(self) -> None:
-        self.music_assets = scan_local_assets(MUSIC_DIR, "music")
-        self.sfx_assets = scan_local_assets(SFX_DIR, "sfx")
+        self.music_assets = library.scan(MUSIC_DIR, "music")
+        self.sfx_assets = library.scan(SFX_DIR, "sfx")
         self.music_panel.set_assets(self.music_assets)
         self.sfx_panel.set_assets(self.sfx_assets)
         self._set_status(f"Biblioteca actualizada: {len(self.music_assets)} pistas de musica y {len(self.sfx_assets)} SFX.")
@@ -1380,8 +1473,9 @@ class AudioHandlerApp:
             "volume_sfx": float(self.volume_vars["volume_sfx"].get()),
             "volume_mic": float(self.volume_vars["volume_mic"].get()),
             "mic_active": bool(self.bool_vars["mic_active"].get()),
-            "loop_music": bool(self.bool_vars["loop_music"].get()),
-            "loop_sfx": bool(self.bool_vars["loop_sfx"].get()),
+            "music_mode": self.music_panel.music_mode(),
+            "music_folder": self.music_panel.folder_var.get(),
+            "sfx_folder": self.sfx_panel.folder_var.get(),
             "monitor_audio": bool(self.bool_vars["monitor_audio"].get()),
             "output_device": self.device_vars["output_device"].get() or None,
             "default_output_device": self.device_vars["output_device"].get() or None,
@@ -1449,8 +1543,16 @@ class AudioHandlerApp:
             self.hotkey_vars[action].set(spec)
         self.apply_hotkeys()
 
+    def _collect_all_hotkeys(self) -> dict[str, str]:
+        hotkeys = self._collect_hotkeys()
+        existing = {asset.key for asset in self.sfx_assets}
+        for key, spec in self.config_manager.as_dict().get("sfx_hotkeys", {}).items():
+            if key in existing:
+                hotkeys[f"sfx:{key}"] = spec
+        return hotkeys
+
     def _register_hotkeys(self) -> None:
-        errors = self.hotkey_manager.set_hotkeys(self._collect_hotkeys())
+        errors = self.hotkey_manager.set_hotkeys(self._collect_all_hotkeys())
         if errors:
             messagebox.showwarning("Hotkeys", "\n".join(errors))
 
@@ -1483,24 +1585,16 @@ class AudioHandlerApp:
                     asset = current_asset
                     break
 
-        self.music_panel.update_progress(
+        self.music_panel.update_music_state(
             asset,
             float(state.get("position_seconds", 0.0)),
             float(state.get("duration_seconds", 0.0)),
             bool(state.get("is_playing", False)),
             bool(state.get("is_paused", False)),
         )
-
-    def seek_music_asset(self, asset: AudioAsset, percentage: float) -> None:
-        duration = float(self.audio_motor.get_music_state().get("duration_seconds", 0.0))
-        if duration <= 0:
-            self.play_music_asset(asset)
-            return
-
-        target_seconds = max(0.0, min(duration, (percentage / 100.0) * duration))
-        self.active_music_asset = asset
-        self.play_music_asset(asset, start_seconds=target_seconds)
-        self._set_status(f"Buscando en musica: {asset.path.name} al {int(percentage)}%")
+        self.sfx_panel.update_sfx_state(self.audio_motor.sfx.active_paths(), self.audio_motor.sfx.looping_paths())
+        if self.audio_motor.music_finished():
+            self.next_music(automatic=True)
 
     def _handle_hotkey_action(self, action: str) -> None:
         handlers: dict[str, Callable[[], None]] = {
@@ -1509,73 +1603,136 @@ class AudioHandlerApp:
             "play_music": self.play_selected_music,
             "stop_music": self.stop_music,
             "pause_music": self.toggle_music_pause,
+            "next_music": self.next_music,
             "play_sfx": self.play_selected_sfx,
+            "next_sfx": self.next_sfx,
             "stop_sfx": self.stop_sfx,
             "pause_sfx": self.toggle_sfx_pause,
             "save_settings": self.save_settings,
         }
+        if action.startswith("sfx:"):
+            key = action[4:]
+            asset = next((item for item in self.sfx_assets if item.key == key), None)
+            if asset is not None:
+                self.play_sfx_asset(asset)
+            return
         handler = handlers.get(action)
         if handler is not None:
             handler()
 
-    def _fill_listbox(self, listbox: tk.Listbox, assets: list[AudioAsset], folder: Path) -> None:
-        listbox.delete(0, tk.END)
-        if not assets:
-            listbox.insert(tk.END, f"No hay archivos mp3 en {folder.name}.")
-            return
-
-        for asset in assets:
-            listbox.insert(tk.END, asset.path.name)
-
+    # ------------------------------------------------------------------ biblioteca
     def _pick_file_and_copy(self, category: str) -> None:
-        target_folder = MUSIC_DIR if category == "music" else SFX_DIR
-        selected_path = filedialog.askopenfilename(
-            title=f"Seleccionar archivo para {category}",
-            filetypes=[("Audio MP3", "*.mp3"), ("Todos los archivos", "*.*")],
+        panel = self.music_panel if category == "music" else self.sfx_panel
+        target_folder = panel.target_dir()
+        selected = filedialog.askopenfilenames(
+            title="Agregar musica" if category == "music" else "Agregar efectos",
+            filetypes=library.FILE_DIALOG_TYPES,
         )
-        if not selected_path:
+        if not selected:
             return
 
-        source = Path(selected_path)
-        destination = target_folder / source.name
-        try:
-            if source.resolve() != destination.resolve():
-                shutil.copy2(source, destination)
-        except OSError as error:
-            self.ui_sounds.play("error")
-            messagebox.showerror("Error", f"No se pudo copiar el archivo:\n{error}")
-            return
+        target_folder.mkdir(parents=True, exist_ok=True)
+        added, errors = 0, []
+        for selected_path in selected:
+            source = Path(selected_path)
+            try:
+                if source.resolve().parent != target_folder.resolve():
+                    shutil.copy2(source, library.unique_destination(target_folder, source.name))
+                added += 1
+            except OSError as error:
+                errors.append(f"{source.name}: {error}")
+                log.error("No se pudo copiar %s: %s", source, error)
 
-        self.ui_sounds.play("confirm")
         self.refresh_library()
-        self._set_status(f"Archivo agregado a {category}: {destination.name}")
+        if errors:
+            self.ui_sounds.play("error")
+            messagebox.showerror("Agregar archivos", "No se pudieron copiar:\n" + "\n".join(errors), parent=self.root)
+        else:
+            self.ui_sounds.play("confirm")
+        where = library.folder_label(target_folder.relative_to(panel.root_dir).as_posix() if target_folder != panel.root_dir else "")
+        self._set_status(f"{added} archivo(s) agregados a {where}.")
 
-    def _first_asset(self, assets: list[AudioAsset]) -> AudioAsset | None:
-        return assets[0] if assets else None
+    def delete_asset(self, asset: AudioAsset) -> None:
+        if not messagebox.askyesno(
+            "Eliminar",
+            f"Enviar \"{asset.path.name}\" a la Papelera de reciclaje?\n\nPodras recuperarlo desde la Papelera.",
+            parent=self.root,
+        ):
+            return
+        self.audio_motor.forget_file(asset.path)
+        try:
+            library.move_to_recycle_bin(asset.path)
+        except OSError as error:
+            log.error("No se pudo eliminar %s: %s", asset.path, error)
+            self.ui_sounds.play("error")
+            messagebox.showerror("Eliminar", f"No se pudo eliminar el archivo:\n{error}", parent=self.root)
+            return
+        if asset.category == "sfx":
+            hotkeys = dict(self.config_manager.as_dict().get("sfx_hotkeys", {}))
+            if hotkeys.pop(asset.key, None) is not None:
+                self.config_manager.updateConfig({"sfx_hotkeys": hotkeys})
+                self.config_manager.saveConfig()
+        if self.active_music_asset == asset:
+            self.active_music_asset = None
+        if self.active_sfx_asset == asset:
+            self.active_sfx_asset = None
+        self.ui_sounds.play("close")
+        self.refresh_library()
+        self._register_hotkeys()
+        self._set_status(f"\"{asset.path.name}\" se envio a la Papelera de reciclaje.")
 
+    # ------------------------------------------------------------------ musica
     def play_music_asset(self, asset: AudioAsset, start_seconds: float = 0.0) -> None:
         self.active_music_asset = asset
-        self.audio_motor.play_music(asset.path, start_seconds=start_seconds)
+        try:
+            self.audio_motor.play_music(asset.path, start_seconds=start_seconds)
+        except Exception as error:  # archivo dañado o formato no soportado
+            log.error("No se pudo reproducir %s: %s", asset.path, error)
+            self.ui_sounds.play("error")
+            self._set_status(f"No se pudo reproducir {asset.path.name}: {error}")
+            return
         self._set_status(f"Reproduciendo musica: {asset.path.name}")
 
-    def play_sfx_asset(self, asset: AudioAsset) -> None:
-        self.active_sfx_asset = asset
-        self.audio_motor.play_sfx(asset.path)
-        self._set_status(f"Reproduciendo SFX: {asset.path.name}")
-
     def play_selected_music(self) -> None:
-        asset = self.active_music_asset or self._first_asset(self.music_assets)
+        playlist = self.music_panel.visible_assets()
+        asset = self.active_music_asset if self.active_music_asset in self.music_assets else None
+        asset = asset or (playlist[0] if playlist else None)
         if asset is None:
-            self._set_status("No hay musica local para reproducir.")
+            self._set_status("No hay musica para reproducir.")
             return
         self.play_music_asset(asset)
 
-    def play_selected_sfx(self) -> None:
-        asset = self.active_sfx_asset or self._first_asset(self.sfx_assets)
-        if asset is None:
-            self._set_status("No hay SFX local para reproducir.")
+    def next_music(self, automatic: bool = False) -> None:
+        playlist = self.music_panel.visible_assets()
+        if not playlist:
+            self._set_status("No hay musica en la carpeta seleccionada.")
             return
-        self.play_sfx_asset(asset)
+        mode = self.music_panel.music_mode()
+        if automatic and mode == "once":
+            self._set_status("Fin de la pista.")
+            return
+        current = self.active_music_asset
+        if mode == "shuffle" and len(playlist) > 1:
+            asset = random.choice([item for item in playlist if item != current])
+        elif current in playlist:
+            asset = playlist[(playlist.index(current) + 1) % len(playlist)]
+        else:
+            asset = playlist[0]
+        self.play_music_asset(asset)
+
+    def set_music_mode(self, mode: str) -> None:
+        self.config_manager.updateConfig({"music_mode": mode})
+        self.audio_motor.set_music_mode(mode)
+        self._set_status(f"Al terminar una pista: {MUSIC_MODE_LABELS[mode]}.")
+
+    def seek_music_asset(self, asset: AudioAsset, percentage: float) -> None:
+        state = self.audio_motor.get_music_state()
+        duration = float(state.get("duration_seconds", 0.0))
+        if state.get("source") != asset.path or duration <= 0:
+            self.play_music_asset(asset)
+            return
+        self.audio_motor.seek_music(max(0.0, min(duration, percentage / 100.0 * duration)))
+        self._set_status(f"Buscando en musica: {asset.path.name} al {int(percentage)}%")
 
     def stop_music(self) -> None:
         self.audio_motor.stop_music()
@@ -1585,13 +1742,91 @@ class AudioHandlerApp:
         self.audio_motor.toggle_music_pause()
         self._set_status("Musica en pausa." if self.audio_motor.music.is_paused() else "Musica reanudada.")
 
-    def stop_sfx(self) -> None:
-        self.audio_motor.stop_sfx()
-        self._set_status("SFX detenido.")
+    # ------------------------------------------------------------------ efectos
+    def play_sfx_asset(self, asset: AudioAsset, loop: bool = False) -> None:
+        self.active_sfx_asset = asset
+        try:
+            self.audio_motor.play_sfx(asset.path, loop=loop)
+        except Exception as error:
+            log.error("No se pudo reproducir %s: %s", asset.path, error)
+            self.ui_sounds.play("error")
+            self._set_status(f"No se pudo reproducir {asset.path.name}: {error}")
+            return
+        self._set_status(f"{'Loop' if loop else 'Efecto'}: {asset.path.name}")
+
+    def toggle_sfx_loop(self, asset: AudioAsset) -> None:
+        if asset.path in self.audio_motor.sfx.looping_paths():
+            self.audio_motor.stop_sfx(asset.path)
+            self._set_status(f"Loop detenido: {asset.path.name}")
+        else:
+            self.play_sfx_asset(asset, loop=True)
+
+    def play_selected_sfx(self) -> None:
+        visible = self.sfx_panel.visible_assets()
+        asset = self.active_sfx_asset if self.active_sfx_asset in self.sfx_assets else None
+        asset = asset or (visible[0] if visible else None)
+        if asset is None:
+            self._set_status("No hay efectos para reproducir.")
+            return
+        self.play_sfx_asset(asset)
+
+    def next_sfx(self) -> None:
+        visible = self.sfx_panel.visible_assets()
+        if not visible:
+            self._set_status("No hay efectos en la carpeta seleccionada.")
+            return
+        current = self.active_sfx_asset
+        asset = visible[(visible.index(current) + 1) % len(visible)] if current in visible else visible[0]
+        self.play_sfx_asset(asset)
+
+    def stop_sfx(self, asset: AudioAsset | None = None) -> None:
+        self.audio_motor.stop_sfx(asset.path if asset is not None else None)
+        self._set_status(f"Efecto detenido: {asset.path.name}" if asset is not None else "Efectos detenidos.")
 
     def toggle_sfx_pause(self) -> None:
         self.audio_motor.toggle_sfx_pause()
-        self._set_status("SFX en pausa." if self.audio_motor.sfx.is_paused() else "SFX reanudado.")
+        self._set_status("Efectos en pausa." if self.audio_motor.sfx.is_paused() else "Efectos reanudados.")
+
+    # ------------------------------------------------------------------ atajos por efecto
+    def sfx_hotkey_for(self, asset: AudioAsset) -> str:
+        return self.config_manager.as_dict().get("sfx_hotkeys", {}).get(asset.key, "")
+
+    def _hotkey_owner(self, spec: str, ignore_key: str | None = None) -> str | None:
+        normalized = spec.replace(" ", "").casefold()
+        for action, current in self._collect_hotkeys().items():
+            if current and current.replace(" ", "").casefold() == normalized:
+                return HOTKEY_ACTIONS[action][0]
+        for key, current in self.config_manager.as_dict().get("sfx_hotkeys", {}).items():
+            if key != ignore_key and current.replace(" ", "").casefold() == normalized:
+                return f"el efecto {Path(key).stem}"
+        return None
+
+    def capture_sfx_hotkey(self, asset: AudioAsset) -> None:
+        self.hotkey_manager.stop()
+        dialog = HotkeyCaptureDialog(self.root, f"el efecto {asset.name}", self.sfx_hotkey_for(asset), allow_clear=True)
+        self.root.wait_window(dialog)
+        hotkeys = dict(self.config_manager.as_dict().get("sfx_hotkeys", {}))
+        if dialog.result is None:
+            self._register_hotkeys()
+            return
+        if dialog.result == "":
+            hotkeys.pop(asset.key, None)
+            message = f"Atajo quitado de {asset.name}."
+        else:
+            owner = self._hotkey_owner(dialog.result, ignore_key=asset.key)
+            if owner is not None:
+                self._register_hotkeys()
+                self.ui_sounds.play("error")
+                messagebox.showwarning("Atajo en uso", f"{dialog.result} ya lo usa {owner}.", parent=self.root)
+                return
+            hotkeys[asset.key] = dialog.result
+            message = f"{asset.name}: {dialog.result}"
+        self.config_manager.updateConfig({"sfx_hotkeys": hotkeys})
+        self.config_manager.saveConfig()
+        self.sfx_panel.refresh_hotkey_labels()
+        self._register_hotkeys()
+        self.ui_sounds.play("confirm")
+        self._set_status(message)
 
     def toggle_microphone(self) -> None:
         new_state = not bool(self.bool_vars["mic_active"].get())
@@ -1601,13 +1836,6 @@ class AudioHandlerApp:
             return  # apply_settings ya mostro el error y desmarco la casilla.
         self.ui_sounds.play("toggle_on" if new_state else "toggle_off")
         self._set_status("Microfono activado." if new_state else "Microfono desactivado.")
-
-    def _show_engine_placeholder(self) -> None:
-        messagebox.showinfo(
-            "Motor base",
-            "La interfaz esta lista. El siguiente paso es integrar el motor de mezcla,\n"
-            "la salida virtual y la gestion simultanea de canales.",
-        )
 
     def _on_close(self) -> None:
         try:

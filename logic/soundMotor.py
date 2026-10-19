@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,8 @@ WINDOWS_DEFAULT_OUTPUTS = {
     "primarysounddriver",
 }
 _stream_log = RateLimitedLogger(log)
+MUSIC_CHANNEL = 0
+MUSIC_MODES = ("playlist", "shuffle", "repeat_one", "once")
 
 try:
     import pygame
@@ -204,166 +207,173 @@ def _sound_to_float32_array(sound: Any) -> np.ndarray | None:
     return array
 
 
-class _OutputMirror:
-    def __init__(self, device: str | None, sample_rate: int) -> None:
-        self.device = device
-        self.sample_rate = sample_rate
-        self.samples: np.ndarray | None = None
-        self.loop = False
-        self.volume = 1.0
-        self.frame_index = 0
-        self.stream: Any | None = None
-        self.active = False
+def music_mode_from_config(config: dict[str, Any]) -> str:
+    mode = config.get("music_mode")
+    return mode if mode in MUSIC_MODES else "playlist"
 
-    def configure(
-        self,
-        samples: np.ndarray | None,
-        *,
-        start_seconds: float = 0.0,
-        loop: bool = False,
-        volume: float = 1.0,
-        device: str | None = None,
-    ) -> None:
-        self.stop()
+
+class _Voice:
+    __slots__ = ("samples", "position", "loop", "volume", "paused")
+
+    def __init__(self, samples: np.ndarray, position: int, loop: bool, volume: float) -> None:
         self.samples = samples
-        self.loop = bool(loop)
-        self.volume = max(0.0, min(1.0, float(volume)))
-        self.frame_index = max(0, int(float(start_seconds) * self.sample_rate))
-        self.device = device or self.device
+        self.position = position
+        self.loop = loop
+        self.volume = volume
+        self.paused = False
 
-        if sd is None or self.samples is None or self.device is None:
-            return
 
-        self._open_stream()
+class MonitorMixer:
+    """Una sola salida de monitor que suma todas las voces (musica y cada SFX).
 
-    def _open_stream(self) -> None:
-        if sd is None or self.samples is None:
-            return
+    Antes cada reproductor abria su propio stream; al cambiar de dispositivo los
+    reproductores viejos se reemplazaban sin cerrarlos y seguian sonando para siempre.
+    Aqui hay un unico stream: cambiar de dispositivo lo cierra y lo reabre.
+    """
 
-        resolved_device = resolve_device(self.device, "output")
-        if resolved_device is None:
+    def __init__(self, sample_rate: int = 44100) -> None:
+        self.sample_rate = sample_rate
+        self.device: str | None = None
+        self.enabled = False
+        self.stream: Any | None = None
+        self._voices: dict[int, _Voice] = {}
+        self._lock = threading.Lock()
+        self._next_id = 1
+
+    def configure(self, enabled: bool, device: str | None) -> bool:
+        """Devuelve True si el stream se (re)abrio y las voces anteriores se descartaron."""
+        if not enabled or device is None or sd is None:
+            self.close()
+            self.enabled = False
+            self.device = device
+            return False
+        if self.stream is not None and self.enabled and device == self.device:
+            return False
+        self.close()
+        self.device = device
+        self.enabled = True
+        self._open()
+        return True
+
+    def _open(self) -> None:
+        resolved = resolve_device(self.device, "output")
+        if resolved is None:
             log.warning("Monitor: no se encontro el dispositivo de salida %r.", self.device)
             return
-
         try:
-            self.stream = sd.OutputStream(
-                device=resolved_device,
-                samplerate=self.sample_rate,
-                channels=int(self.samples.shape[1]),
-                dtype="float32",
-                callback=self._callback,
-            )
-            assert self.stream is not None
+            self.stream = sd.OutputStream(device=resolved, samplerate=self.sample_rate, channels=2,
+                                          dtype="float32", callback=self._callback)
             self.stream.start()
-            self.active = True
         except Exception as error:
             log.error("Monitor: no se pudo abrir la salida %r: %s", self.device, error)
             self.stream = None
-            self.active = False
+
+    def close(self) -> None:
+        stream, self.stream = self.stream, None
+        if stream is not None:
+            try:
+                stream.stop()
+            finally:
+                stream.close()
+        with self._lock:
+            self._voices.clear()
+
+    @property
+    def active(self) -> bool:
+        return self.stream is not None
+
+    def add(self, samples: np.ndarray | None, start_seconds: float = 0.0, loop: bool = False, volume: float = 1.0) -> int | None:
+        if self.stream is None or samples is None or samples.size == 0:
+            return None
+        position = max(0, int(start_seconds * self.sample_rate))
+        if not loop and position >= samples.shape[0]:
+            return None
+        with self._lock:
+            voice_id = self._next_id
+            self._next_id += 1
+            self._voices[voice_id] = _Voice(samples, position % samples.shape[0], loop, volume)
+        return voice_id
+
+    def remove(self, voice_id: int | None) -> None:
+        if voice_id is not None:
+            with self._lock:
+                self._voices.pop(voice_id, None)
+
+    def set_volume(self, voice_id: int | None, volume: float) -> None:
+        voice = self._voices.get(voice_id) if voice_id is not None else None
+        if voice is not None:
+            voice.volume = volume
+
+    def set_paused(self, voice_id: int | None, paused: bool) -> None:
+        voice = self._voices.get(voice_id) if voice_id is not None else None
+        if voice is not None:
+            voice.paused = paused
+
+    def set_loop(self, voice_id: int | None, loop: bool) -> None:
+        voice = self._voices.get(voice_id) if voice_id is not None else None
+        if voice is not None:
+            voice.loop = loop
+
+    def voice_count(self) -> int:
+        return len(self._voices)
 
     def _callback(self, outdata, frames, time_info, status):
         if status:
             _stream_log.warning("monitor", f"Monitor: {status}")
-
         outdata.fill(0)
-        if self.samples is None or self.samples.size == 0:
-            callback_stop = getattr(sd, "CallbackStop", None)
-            if callback_stop is not None:
-                raise callback_stop()
-            return
-
-        total_frames = int(self.samples.shape[0])
-        channels = int(self.samples.shape[1])
-        start_frame = int(self.frame_index)
-
-        if self.loop and total_frames > 0:
-            indices = (np.arange(start_frame, start_frame + frames) % total_frames).astype(np.int64)
-            chunk = self.samples[indices]
-            outdata[:] = chunk * self.volume
-            self.frame_index = (start_frame + frames) % total_frames
-            return
-
-        end_frame = min(total_frames, start_frame + frames)
-        chunk = self.samples[start_frame:end_frame]
-        if chunk.size > 0:
-            outdata[: chunk.shape[0], :channels] = chunk * self.volume
-
-        self.frame_index = end_frame
-        if end_frame >= total_frames:
-            callback_stop = getattr(sd, "CallbackStop", None)
-            if callback_stop is not None:
-                raise callback_stop()
-
-    def pause(self) -> None:
-        if self.stream is not None:
-            self.stream.stop()
-            self.stream.close()
-        self.stream = None
-        self.active = False
-
-    def resume(self) -> None:
-        if self.samples is None or sd is None or self.device is None or self.active:
-            return
-        self._open_stream()
-
-    def seek(self, start_seconds: float) -> None:
-        self.frame_index = max(0, int(float(start_seconds) * self.sample_rate))
-
-    def stop(self) -> None:
-        if self.stream is not None:
-            try:
-                self.stream.stop()
-            finally:
-                self.stream.close()
-        self.stream = None
-        self.active = False
+        with self._lock:
+            voices = list(self._voices.items())
+        finished: list[int] = []
+        for voice_id, voice in voices:
+            if voice.paused:
+                continue
+            samples = voice.samples
+            total = samples.shape[0]
+            start = voice.position
+            if voice.loop:
+                chunk = samples[np.arange(start, start + frames) % total]
+                voice.position = (start + frames) % total
+            else:
+                chunk = samples[start:start + frames]
+                voice.position = start + chunk.shape[0]
+                if voice.position >= total:
+                    finished.append(voice_id)
+            outdata[: chunk.shape[0]] += chunk * voice.volume
+        np.clip(outdata, -1.0, 1.0, out=outdata)
+        if finished:
+            with self._lock:
+                for voice_id in finished:
+                    self._voices.pop(voice_id, None)
 
 
-class singleSoundHandler:
+def _stereo_float(sound: Any) -> np.ndarray | None:
+    array = _sound_to_float32_array(sound)
+    if array is None:
+        return None
+    if array.shape[1] == 1:
+        array = np.repeat(array, 2, axis=1)
+    return np.ascontiguousarray(array[:, :2])
+
+
+class PygameOutput:
+    """Inicializacion del mixer global de pygame sobre la salida objetivo."""
+
     _mixer_ready = False
     _current_device: str | None = None
     # Nombre del dispositivo que pygame abrio realmente, o None si uso el de Windows.
     opened_device: str | None = None
     fallback_warning: str | None = None
-
-    def __init__(
-        self,
-        soundFile: str | Path | None = None,
-        config: dict[str, Any] | None = None,
-        output_device: str | None = None,
-        max_channels: int = 8,
-    ) -> None:
-        self.sound_file: Path | None = None
-        self.sound: Any = None
-        self.channel: Any = None
-        self.loop = False
-        self.volume = 1.0
-        self.duck_gain = 1.0
-        self.paused = False
-        self.monitor_enabled = False
-        self.monitor_device: str | None = None
-        self._mirror = _OutputMirror(output_device, 44100)
-        self._mirror_samples: np.ndarray | None = None
-        self.max_channels = max(1, min(8, int(max_channels)))
-        self._ensure_mixer(output_device)
-        self.apply_config(config or {})
-        if soundFile is not None:
-            self.set_source(soundFile)
+    CHANNELS = 32  # musica + muchos SFX superpuestos
 
     @classmethod
-    def _ensure_mixer(cls, output_device: str | None) -> None:
+    def ensure(cls, output_device: str | None) -> None:
         if pygame is None:
             cls._mixer_ready = False
             cls._current_device = output_device
             return
 
         if not pygame.mixer.get_init():
-            mixer_kwargs: dict[str, Any] = {
-                "frequency": 44100,
-                "size": -16,
-                "channels": 2,
-                "buffer": 1024,
-            }
+            mixer_kwargs: dict[str, Any] = {"frequency": 44100, "size": -16, "channels": 2, "buffer": 1024}
             cls.opened_device = None
             cls.fallback_warning = None
             # Los alias de "salida predeterminada" de Windows no existen para SDL:
@@ -391,149 +401,161 @@ class singleSoundHandler:
                         "suenan por la salida predeterminada de Windows."
                     )
 
-        pygame.mixer.set_num_channels(8)
+        pygame.mixer.set_num_channels(cls.CHANNELS)
+        # El canal 0 queda reservado para la musica: los SFX nunca se lo quitan.
+        pygame.mixer.set_reserved(1)
         cls._mixer_ready = True
         cls._current_device = output_device
 
     @classmethod
-    def reinitialize_mixer(cls, output_device: str | None) -> None:
+    def reinitialize(cls, output_device: str | None) -> None:
         if pygame is None:
             cls._mixer_ready = False
             cls._current_device = output_device
             return
-
         if pygame.mixer.get_init():
             pygame.mixer.stop()
             pygame.mixer.quit()
         cls._mixer_ready = False
-        cls._ensure_mixer(output_device)
+        cls.ensure(output_device)
 
-    def set_source(self, soundFile: str | Path | None) -> None:
-        self._mirror_samples = None
-        if soundFile is None:
-            self.sound_file = None
-            self.sound = None
-            self._mirror.stop()
-            return
 
-        self.sound_file = Path(soundFile)
-        if pygame is None:
-            self.sound = None
-            return
+class _SfxVoice:
+    __slots__ = ("path", "sound", "channel", "loop", "monitor_id")
 
-        # El volumen se aplica solo en el Channel; Sound queda en 1.0 para no elevarlo al cuadrado.
-        self.sound = pygame.mixer.Sound(str(self.sound_file))
+    def __init__(self, path: Path, sound: Any, channel: Any, loop: bool, monitor_id: int | None) -> None:
+        self.path = path
+        self.sound = sound
+        self.channel = channel
+        self.loop = loop
+        self.monitor_id = monitor_id
 
-    def _clamp_volume(self, volume: Any) -> float:
-        try:
-            return max(0.0, min(1.0, float(volume)))
-        except (TypeError, ValueError):
-            return 1.0
+
+class SfxPlayer:
+    """Efectos superpuestos: cada Play suena una vez (o en loop) sin cortar a los demas."""
+
+    def __init__(self, monitor: MonitorMixer, volume: float = 1.0) -> None:
+        self.monitor = monitor
+        self.volume = volume
+        self.duck_gain = 1.0
+        self.paused = False
+        self._cache: dict[Path, tuple[Any, np.ndarray | None]] = {}
+        self._voices: list[_SfxVoice] = []
 
     def effective_volume(self) -> float:
         return self.volume * self.duck_gain
 
-    def _apply_volume(self) -> None:
-        if self.channel is not None:
-            self.channel.set_volume(self.effective_volume())
-        self._mirror.volume = self.effective_volume()
+    def _load(self, path: Path) -> tuple[Any, np.ndarray | None]:
+        cached = self._cache.get(path)
+        if cached is None:
+            sound = pygame.mixer.Sound(str(path))
+            cached = (sound, None)
+            self._cache[path] = cached
+        return cached
 
-    def _monitor_samples(self) -> np.ndarray | None:
-        if self._mirror_samples is None:
-            self._mirror_samples = _sound_to_float32_array(self.sound)
-        return self._mirror_samples
+    def _monitor_samples(self, path: Path) -> np.ndarray | None:
+        sound, samples = self._cache[path]
+        if samples is None:
+            samples = _stereo_float(sound)
+            self._cache[path] = (sound, samples)
+        return samples
 
-    def _start_monitor(self, loop: bool) -> None:
-        self._mirror.configure(
-            self._monitor_samples(),
-            start_seconds=0.0,
-            loop=loop,
-            volume=self.effective_volume(),
-            device=self.monitor_device,
-        )
+    def clear_cache(self) -> None:
+        """Tras reiniciar el mixer los Sound anteriores dejan de ser validos."""
+        self.stop()
+        self._cache.clear()
 
-    def apply_config(self, config: dict[str, Any]) -> None:
-        self.volume = self._clamp_volume(config.get("volume", config.get("volume_music", config.get("volume_sfx", 1.0))))
-        self.loop = bool(config.get("loop", config.get("loop_music", config.get("loop_sfx", False))))
-        monitor_enabled = bool(config.get("monitor_enabled", config.get("monitor_audio", False)))
-        self.monitor_device = config.get("monitor_output_device") or None
-        self._apply_volume()
-        # Solo se (re)abre el espejo al activarlo; aplicar ajustes ya no lo reinicia desde 0.
-        if monitor_enabled and not self.monitor_enabled and self.is_playing() and not self.paused:
-            self.monitor_enabled = True
-            self._start_monitor(self.loop)
-        elif not monitor_enabled:
-            self._mirror.stop()
-        self.monitor_enabled = monitor_enabled
+    def forget(self, path: Path) -> None:
+        self.stop(path)
+        self._cache.pop(Path(path), None)
 
-    def set_monitor(self, enabled: bool, device: str | None) -> None:
-        self.monitor_enabled = bool(enabled)
-        self.monitor_device = device
-        if not self.monitor_enabled:
-            self._mirror.stop()
+    def play(self, path: str | Path, loop: bool = False) -> bool:
+        if pygame is None:
+            return False
+        path = Path(path)
+        sound, _samples = self._load(path)
+        if loop:
+            self.stop(path)  # un mismo efecto en loop no se duplica
+        channel = pygame.mixer.find_channel(True)  # True: si no hay libres, reutiliza el mas antiguo
+        if channel is None:
+            return False
+        channel.play(sound, loops=-1 if loop else 0)
+        channel.set_volume(self.effective_volume())
+        monitor_id = None
+        if self.monitor.active:
+            monitor_id = self.monitor.add(self._monitor_samples(path), loop=loop, volume=self.effective_volume())
+        self._voices.append(_SfxVoice(path, sound, channel, loop, monitor_id))
+        self.paused = False
+        return True
 
-    def play(self, soundFile: str | Path | None = None, loop: bool | None = None) -> None:
-        if soundFile is not None:
-            self.set_source(soundFile)
-        if self.sound is None:
+    def _alive(self, voice: _SfxVoice) -> bool:
+        channel = voice.channel
+        return channel.get_busy() and channel.get_sound() is voice.sound
+
+    def tick(self) -> None:
+        if self.paused:
             return
+        alive = []
+        for voice in self._voices:
+            if self._alive(voice):
+                alive.append(voice)
+            else:
+                self.monitor.remove(voice.monitor_id)
+        self._voices = alive
 
-        if self.channel is not None and getattr(self.channel, "get_busy", lambda: False)():
-            self.channel.stop()
-
-        loop_enabled = self.loop if loop is None else bool(loop)
-        self.channel = self.sound.play(loops=-1 if loop_enabled else 0)
-        self._apply_volume()
-        if self.monitor_enabled:
-            self._start_monitor(loop_enabled)
-        self.paused = False
-
-    def stop(self) -> None:
-        if self.channel is not None:
-            self.channel.stop()
-        self.paused = False
-        self._mirror.stop()
-
-    def pause(self) -> None:
-        if self.channel is not None and getattr(self.channel, "get_busy", lambda: False)():
-            self.channel.pause()
-            self.paused = True
-            self._mirror.pause()
-
-    def resume(self) -> None:
-        if self.channel is not None and self.paused:
-            self.channel.unpause()
+    def stop(self, path: str | Path | None = None) -> None:
+        target = Path(path) if path is not None else None
+        remaining = []
+        for voice in self._voices:
+            if target is None or voice.path == target:
+                if self._alive(voice):
+                    voice.channel.stop()
+                self.monitor.remove(voice.monitor_id)
+            else:
+                remaining.append(voice)
+        self._voices = remaining
+        if not self._voices:
             self.paused = False
-            self._mirror.resume()
 
     def toggle_pause(self) -> None:
-        if self.paused:
-            self.resume()
-        else:
-            self.pause()
+        if not self._voices:
+            return
+        self.paused = not self.paused
+        for voice in self._voices:
+            if voice.channel.get_sound() is voice.sound:
+                voice.channel.pause() if self.paused else voice.channel.unpause()
+            self.monitor.set_paused(voice.monitor_id, self.paused)
+
+    def is_paused(self) -> bool:
+        return self.paused
+
+    def is_playing(self) -> bool:
+        return any(self._alive(voice) for voice in self._voices)
+
+    def active_paths(self) -> set[Path]:
+        return {voice.path for voice in self._voices if self._alive(voice)}
+
+    def looping_paths(self) -> set[Path]:
+        return {voice.path for voice in self._voices if voice.loop and self._alive(voice)}
+
+    def _apply_volume(self) -> None:
+        volume = self.effective_volume()
+        for voice in self._voices:
+            if voice.channel.get_sound() is voice.sound:
+                voice.channel.set_volume(volume)
+            self.monitor.set_volume(voice.monitor_id, volume)
 
     def set_volume(self, volume: float) -> None:
-        self.volume = self._clamp_volume(volume)
+        self.volume = max(0.0, min(1.0, float(volume)))
         self._apply_volume()
 
     def set_duck_gain(self, gain: float) -> None:
         self.duck_gain = max(0.0, min(1.0, float(gain)))
         self._apply_volume()
 
-    def is_playing(self) -> bool:
-        return self.channel is not None and getattr(self.channel, "get_busy", lambda: False)()
-
-    def is_paused(self) -> bool:
-        return self.paused
-
-    def set_loop(self, loop: bool) -> None:
-        self.loop = bool(loop)
-        if self.channel is not None and getattr(self.channel, "get_busy", lambda: False)():
-            self.channel.stop()
-            self.channel = self.sound.play(loops=-1 if self.loop else 0) if self.sound is not None else None
-            self._apply_volume()
-            if self.monitor_enabled:
-                self._start_monitor(self.loop)
+    def drop_monitor_voices(self) -> None:
+        for voice in self._voices:
+            voice.monitor_id = None
 
 
 class SeekableMusicHandler:
@@ -542,40 +564,30 @@ class SeekableMusicHandler:
     Tras un seek se reproduce un Sound recortado (desde el punto elegido) y, si hay
     loop, se encola la pista completa justo antes de que termine. Asi el loop vuelve
     al inicio de la cancion y la posicion es simplemente (inicio + transcurrido) % duracion.
+    Sin loop, al terminar la pista se marca `finished` para que la app pase a la siguiente.
     """
 
     # Margen para encolar la siguiente vuelta; tick() se llama varias veces por segundo.
     QUEUE_AHEAD_SECONDS = 1.5
 
-    def __init__(
-        self,
-        config: dict[str, Any] | None = None,
-        output_device: str | None = None,
-    ) -> None:
+    def __init__(self, monitor: MonitorMixer, volume: float = 1.0, loop: bool = False) -> None:
+        self.monitor = monitor
         self.sound_file: Path | None = None
         self.sound: Any = None
         self.samples: np.ndarray | None = None
         self.playback_sound: Any = None
         self.channel: Any = None
         self.duration_seconds = 0.0
-        self.loop = False
-        self.volume = 1.0
+        self.loop = loop
+        self.volume = volume
         self.duck_gain = 1.0
         self.paused = False
-        self.monitor_enabled = False
-        self.monitor_device: str | None = None
-        self._mirror = _OutputMirror(None, 44100)
-        self._mirror_samples: np.ndarray | None = None
+        self.finished = False
+        self._monitor_samples: np.ndarray | None = None
+        self._monitor_id: int | None = None
         self._play_started_at: float | None = None
         self._base_position_seconds = 0.0
         self._paused_position_seconds = 0.0
-        self._ensure_mixer(output_device)
-        self.apply_config(config or {})
-
-    @classmethod
-    def _ensure_mixer(cls, output_device: str | None) -> None:
-        # El mixer de pygame es global: se comparte la logica de seleccion de dispositivo.
-        singleSoundHandler._ensure_mixer(output_device)
 
     def _elapsed_position_seconds(self) -> float:
         if self.paused:
@@ -598,23 +610,20 @@ class SeekableMusicHandler:
     def _apply_volume(self) -> None:
         if self.channel is not None:
             self.channel.set_volume(self.effective_volume())
-        self._mirror.volume = self.effective_volume()
+        self.monitor.set_volume(self._monitor_id, self.effective_volume())
 
-    def _start_monitor(self, start_seconds: float) -> None:
-        if not self.monitor_enabled:
-            self._mirror.stop()
+    def restart_monitor(self) -> None:
+        """Vuelve a crear la voz de monitor (tras cambiar de dispositivo o activarlo)."""
+        self.monitor.remove(self._monitor_id)
+        self._monitor_id = None
+        if not self.monitor.active or self.sound is None or self.channel is None:
             return
-
-        # El espejo recorre la pista completa (no el tramo recortado), con su propio loop.
-        if self._mirror_samples is None:
-            self._mirror_samples = _sound_to_float32_array(self.sound)
-        self._mirror.configure(
-            self._mirror_samples,
-            start_seconds=start_seconds,
-            loop=self.loop,
-            volume=self.effective_volume(),
-            device=self.monitor_device,
-        )
+        if self._monitor_samples is None:
+            self._monitor_samples = _stereo_float(self.sound)
+        # La voz de monitor recorre la pista completa (no el tramo recortado), con su propio loop.
+        self._monitor_id = self.monitor.add(self._monitor_samples, start_seconds=self._current_position_seconds(),
+                                            loop=self.loop, volume=self.effective_volume())
+        self.monitor.set_paused(self._monitor_id, self.paused)
 
     def _build_playback_sound(self, start_seconds: float = 0.0) -> Any | None:
         if self.sound is None or self.samples is None:
@@ -633,14 +642,14 @@ class SeekableMusicHandler:
             return self.sound
 
     def set_source(self, soundFile: str | Path | None) -> None:
-        self._mirror_samples = None
+        self._monitor_samples = None
         if soundFile is None:
+            self.stop()
             self.sound_file = None
             self.sound = None
             self.samples = None
             self.playback_sound = None
             self.duration_seconds = 0.0
-            self.stop()
             return
 
         self.sound_file = Path(soundFile)
@@ -656,34 +665,14 @@ class SeekableMusicHandler:
         self.playback_sound = self.sound
         self.duration_seconds = float(self.sound.get_length())
 
-    def _clamp_volume(self, volume: Any) -> float:
-        try:
-            return max(0.0, min(1.0, float(volume)))
-        except (TypeError, ValueError):
-            return 1.0
-
-    def apply_config(self, config: dict[str, Any]) -> None:
-        self.volume = self._clamp_volume(config.get("volume", config.get("volume_music", 1.0)))
-        self.loop = bool(config.get("loop", config.get("loop_music", True)))
-        self._mirror.loop = self.loop
-        monitor_enabled = bool(config.get("monitor_enabled", config.get("monitor_audio", False)))
-        self.monitor_device = config.get("monitor_output_device") or None
-        self._apply_volume()
-        if monitor_enabled and not self.monitor_enabled and self.is_playing():
-            self.monitor_enabled = True
-            self._start_monitor(self._current_position_seconds())
-        elif not monitor_enabled:
-            self._mirror.stop()
-        self.monitor_enabled = monitor_enabled
-
     def play(self, soundFile: str | Path | None = None, loop: bool | None = None, start_seconds: float = 0.0) -> None:
         if soundFile is not None:
             self.set_source(soundFile)
         if self.sound is None or pygame is None:
             return
 
-        loop_enabled = self.loop if loop is None else bool(loop)
-        self.loop = loop_enabled
+        if loop is not None:
+            self.loop = bool(loop)
         start_seconds = max(0.0, float(start_seconds))
         if self.duration_seconds > 0:
             start_seconds = min(start_seconds, self.duration_seconds)
@@ -692,24 +681,36 @@ class SeekableMusicHandler:
         if self.playback_sound is None:
             return
 
-        if self.channel is not None and getattr(self.channel, "get_busy", lambda: False)():
+        if self.channel is not None and self.channel.get_busy():
             self.channel.stop()
 
         # Siempre loops=0: el loop se arma encolando la pista completa en tick().
-        self.channel = self.playback_sound.play(loops=0)
-        self._apply_volume()
+        self.channel = pygame.mixer.Channel(MUSIC_CHANNEL)
+        self.channel.play(self.playback_sound, loops=0)
         self._base_position_seconds = start_seconds
         self._play_started_at = time.monotonic()
         self._paused_position_seconds = start_seconds
         self.paused = False
-        self._start_monitor(start_seconds)
+        self.finished = False
+        self._apply_volume()
+        self.restart_monitor()
         self.tick()
 
     def tick(self) -> None:
-        """Encola la siguiente vuelta del loop cuando se acerca el final."""
-        if not self.loop or self.paused or self.channel is None or self.sound is None or self.duration_seconds <= 0:
+        """Encola la siguiente vuelta del loop, o detecta el final de la pista."""
+        if self.paused or self.channel is None or self.sound is None or self.duration_seconds <= 0:
             return
-        if not getattr(self.channel, "get_busy", lambda: False)():
+        sounding = self.channel.get_busy() and self.channel.get_sound() in (self.playback_sound, self.sound)
+        if not self.loop:
+            if not sounding:
+                self.monitor.remove(self._monitor_id)
+                self._monitor_id = None
+                self.channel = None
+                self._play_started_at = None
+                self._base_position_seconds = self.duration_seconds
+                self.finished = True
+            return
+        if not sounding:
             # Se perdio la ventana para encolar (UI bloqueada): se retoma desde el inicio.
             self.play(loop=True, start_seconds=0.0)
             return
@@ -717,40 +718,38 @@ class SeekableMusicHandler:
         if remaining <= self.QUEUE_AHEAD_SECONDS and self.channel.get_queue() is None:
             self.channel.queue(self.sound)
 
+    def consume_finished(self) -> bool:
+        finished, self.finished = self.finished, False
+        return finished
+
     def stop(self) -> None:
-        if self.channel is not None:
+        if self.channel is not None and self.channel.get_sound() in (self.playback_sound, self.sound):
             self.channel.stop()
-        self._mirror.stop()
+        self.monitor.remove(self._monitor_id)
+        self._monitor_id = None
         self.paused = False
+        self.finished = False
         self.channel = None
         self._play_started_at = None
         self._base_position_seconds = 0.0
         self._paused_position_seconds = 0.0
 
     def pause(self) -> None:
-        if pygame is None or self.channel is None:
+        if pygame is None or self.channel is None or not self.is_playing():
             return
-
-        if not self.is_playing():
-            return
-
         self._paused_position_seconds = self._current_position_seconds()
         self.channel.pause()
-        self._mirror.pause()
+        self.monitor.set_paused(self._monitor_id, True)
         self.paused = True
 
     def resume(self) -> None:
-        if pygame is None or self.sound is None or self.channel is None:
+        if pygame is None or self.sound is None or self.channel is None or not self.paused:
             return
-
-        if not self.paused:
-            return
-
         self.channel.unpause()
         self._base_position_seconds = self._paused_position_seconds
         self._play_started_at = time.monotonic()
         self.paused = False
-        self._start_monitor(self._paused_position_seconds)
+        self.restart_monitor()
 
     def toggle_pause(self) -> None:
         if self.paused:
@@ -759,7 +758,7 @@ class SeekableMusicHandler:
             self.pause()
 
     def set_volume(self, volume: float) -> None:
-        self.volume = self._clamp_volume(volume)
+        self.volume = max(0.0, min(1.0, float(volume)))
         self._apply_volume()
 
     def set_duck_gain(self, gain: float) -> None:
@@ -767,32 +766,39 @@ class SeekableMusicHandler:
         self._apply_volume()
 
     def set_loop(self, loop: bool) -> None:
-        self.loop = bool(loop)
-        self._mirror.loop = self.loop
+        loop = bool(loop)
+        if loop == self.loop:
+            return
+        # La posicion se calcula distinto con y sin loop: se fija antes de cambiar el modo.
+        position = self._current_position_seconds()
+        self._base_position_seconds = position
+        self._paused_position_seconds = position
+        if self._play_started_at is not None:
+            self._play_started_at = time.monotonic()
+        self.loop = loop
+        self.monitor.set_loop(self._monitor_id, self.loop)
 
     def seek(self, seconds: float) -> None:
         if self.sound is None:
             return
-
         keep_paused = self.paused
         # Sin pasar la ruta: re-decodificar el MP3 completo en cada seek era muy lento.
-        self.play(loop=self.loop, start_seconds=seconds)
+        self.play(start_seconds=seconds)
         if keep_paused:
             self.pause()
 
     def is_playing(self) -> bool:
         if pygame is None:
             return False
-        return self.channel is not None and bool(getattr(self.channel, "get_busy", lambda: False)()) and not self.paused
+        return self.channel is not None and bool(self.channel.get_busy()) and not self.paused
 
     def is_paused(self) -> bool:
         return self.paused
 
     def get_state(self) -> dict[str, Any]:
-        position = self._current_position_seconds()
         return {
             "source": self.sound_file,
-            "position_seconds": position,
+            "position_seconds": self._current_position_seconds(),
             "duration_seconds": self.duration_seconds,
             "is_playing": self.is_playing(),
             "is_paused": self.paused,
@@ -822,28 +828,14 @@ class soundMotor:
         self._duck_gain = 1.0
         self._last_tick: float | None = None
         self.music_source: Path | None = None
-        self.sfx_source: Path | None = None
+        self.music_mode = music_mode_from_config(self.config)
 
-        singleSoundHandler.reinitialize_mixer(self.output_device)
-        self.music = SeekableMusicHandler(
-            config={
-                "volume": self.config.get("volume_music", 1.0),
-                "loop": self.config.get("loop_music", True),
-                "monitor_audio": self.monitor_audio,
-                "monitor_output_device": self.monitor_output_device,
-            },
-            output_device=self.output_device,
-        )
-        self.sfx = singleSoundHandler(
-            config={
-                "volume": self.config.get("volume_sfx", 1.0),
-                "loop": self.config.get("loop_sfx", False),
-                "monitor_audio": self.monitor_audio,
-                "monitor_output_device": self.monitor_output_device,
-            },
-            output_device=self.output_device,
-            max_channels=self.max_channels,
-        )
+        PygameOutput.reinitialize(self.output_device)
+        self.monitor = MonitorMixer()
+        self.monitor.configure(self.monitor_audio, self.monitor_output_device)
+        self.music = SeekableMusicHandler(self.monitor, float(self.config.get("volume_music", 1.0)),
+                                          loop=self.music_mode == "repeat_one")
+        self.sfx = SfxPlayer(self.monitor, float(self.config.get("volume_sfx", 1.0)))
 
     def _device_info(self, index: int | None) -> dict[str, Any] | None:
         if index is None or sd is None:
@@ -977,7 +969,7 @@ class soundMotor:
 
     @property
     def playback_warning(self) -> str | None:
-        return singleSoundHandler.fallback_warning
+        return PygameOutput.fallback_warning
 
     def is_voice_active(self) -> bool:
         processor = self.mic_processor
@@ -990,6 +982,7 @@ class soundMotor:
         self._last_tick = now
 
         self.music.tick()
+        self.sfx.tick()
 
         target = self.ducking_level if self.ducking_enabled and self.is_voice_active() else 1.0
         # Baja rapido al empezar a hablar (~60 ms) y vuelve suave al callar (~400 ms).
@@ -1005,14 +998,15 @@ class soundMotor:
         """Cierra todo stream de sounddevice (para re-escanear dispositivos). Devuelve si el mic estaba activo."""
         mic_was_active = self.mic_active
         self.stop_mic()
-        self.music._mirror.stop()
-        self.sfx._mirror.stop()
+        self.monitor.close()
+        self.sfx.drop_monitor_voices()
         return mic_was_active
 
     def shutdown(self) -> None:
         self.stop_mic()
         self.music.stop()
         self.sfx.stop()
+        self.monitor.close()
         if pygame is not None and pygame.mixer.get_init():
             pygame.mixer.quit()
 
@@ -1032,10 +1026,6 @@ class soundMotor:
         self.music_source = Path(sound_file) if sound_file is not None else None
         self.music.set_source(self.music_source)
 
-    def set_sfx_source(self, sound_file: str | Path | None) -> None:
-        self.sfx_source = Path(sound_file) if sound_file is not None else None
-        self.sfx.set_source(self.sfx_source)
-
     def define_output_device(self, device_name: str | None) -> None:
         self.output_device = device_name or self.config.get("default_output_device")
         self.config["output_device"] = self.output_device
@@ -1053,83 +1043,54 @@ class soundMotor:
             self.start_mic()
 
     def _rebuild_playback_engine(self) -> None:
-        music_source = self.music_source
-        sfx_source = self.sfx_source
-        music_state = self.music.get_state() if hasattr(self.music, "get_state") else {}
-        sfx_is_playing = self.sfx.is_playing()
-        sfx_is_paused = self.sfx.is_paused()
-        music_is_paused = bool(music_state.get("is_paused", False))
+        """Reabre pygame en otra salida conservando la musica (los SFX en curso se cortan)."""
+        music_state = self.music.get_state()
+        music_was_active = bool(music_state.get("is_playing") or music_state.get("is_paused"))
         music_position = float(music_state.get("position_seconds", 0.0))
-        sfx_is_playing = self.sfx.is_playing()
+        music_paused = bool(music_state.get("is_paused"))
 
-        singleSoundHandler.reinitialize_mixer(self.output_device)
-        self.music = SeekableMusicHandler(
-            config={
-                "volume": self.config_manager.volume_music(),
-                "loop": self.config_manager.loop_music(),
-                "monitor_audio": self.monitor_audio,
-                "monitor_output_device": self.monitor_output_device,
-            },
-            output_device=self.output_device,
-        )
-        self.sfx = singleSoundHandler(
-            config={
-                "volume": self.config_manager.volume_sfx(),
-                "loop": self.config_manager.loop_sfx(),
-                "monitor_audio": self.monitor_audio,
-                "monitor_output_device": self.monitor_output_device,
-            },
-            output_device=self.output_device,
-            max_channels=self.max_channels,
-        )
+        # Primero se detiene todo lo viejo: antes quedaba sonando y se acumulaba.
+        self.music.stop()
+        self.sfx.clear_cache()
+        PygameOutput.reinitialize(self.output_device)
 
-        if music_source is not None:
-            self.music.set_source(music_source)
-            if music_state.get("is_playing", False) or music_is_paused:
-                self.music.play(loop=self.config_manager.loop_music(), start_seconds=music_position)
-                if music_is_paused:
+        if self.music_source is not None:
+            self.music.set_source(self.music_source)
+            if music_was_active:
+                self.music.play(start_seconds=music_position)
+                if music_paused:
                     self.music.pause()
-        if sfx_source is not None:
-            self.sfx.set_source(sfx_source)
-            if sfx_is_playing:
-                self.sfx.play(loop=self.config_manager.loop_sfx())
-                if sfx_is_paused:
-                    self.sfx.pause()
+
+    def set_music_mode(self, mode: str) -> None:
+        self.music_mode = mode if mode in MUSIC_MODES else "playlist"
+        self.music.set_loop(self.music_mode == "repeat_one")
 
     def apply_config(self, current_config: dict[str, Any]) -> None:
         self.config = dict(current_config)
-        self.max_channels = max(1, min(8, int(self.config.get("max_channels", 8))))
         self.sample_rate = int(self.config.get("sample_rate", 44100))
         self.buffer_size = int(self.config.get("buffer_size", 1024))
         self.mic_volume = float(self.config.get("volume_mic", 1.0))
         self.monitor_audio = bool(self.config.get("monitor_audio", False))
         self.update_mic_filter(self.config)
+        self.set_music_mode(music_mode_from_config(self.config))
+        self.music.set_volume(float(self.config.get("volume_music", 1.0)))
+        self.sfx.set_volume(float(self.config.get("volume_sfx", 1.0)))
 
         output_device = self.config.get("output_device") or self.config.get("default_output_device")
         monitor_output_device = self.config.get("monitor_output_device") or output_device
         input_device = self.config.get("mic_input_device")
 
-        if output_device != self.output_device or monitor_output_device != self.monitor_output_device:
+        if output_device != self.output_device:
             self.output_device = output_device
-            self.monitor_output_device = monitor_output_device
             self._rebuild_playback_engine()
-        else:
-            self.music.apply_config(
-                {
-                    "volume": self.config.get("volume_music", 1.0),
-                    "loop": self.config.get("loop_music", True),
-                    "monitor_audio": self.monitor_audio,
-                    "monitor_output_device": self.monitor_output_device,
-                }
-            )
-            self.sfx.apply_config(
-                {
-                    "volume": self.config.get("volume_sfx", 1.0),
-                    "loop": self.config.get("loop_sfx", False),
-                    "monitor_audio": self.monitor_audio,
-                    "monitor_output_device": self.monitor_output_device,
-                }
-            )
+
+        self.monitor_output_device = monitor_output_device
+        if self.monitor.configure(self.monitor_audio, monitor_output_device):
+            # El mezclador se reabrio: la musica vuelve a sonar en el monitor nuevo, en su posicion.
+            self.sfx.drop_monitor_voices()
+            self.music.restart_monitor()
+        elif not self.monitor.active:
+            self.sfx.drop_monitor_voices()
 
         if input_device != self.mic_input_device:
             self.mic_input_device = input_device
@@ -1145,15 +1106,16 @@ class soundMotor:
     def update(self, current_config: dict[str, Any]) -> None:
         self.apply_config(current_config)
 
-    def play_sfx(self, sound_file: str | Path | None = None) -> None:
-        if sound_file is not None:
-            self.set_sfx_source(sound_file)
-        self.sfx.play(loop=self.config_manager.loop_sfx())
+    def play_sfx(self, sound_file: str | Path, loop: bool = False) -> bool:
+        return self.sfx.play(sound_file, loop=loop)
 
     def play_music(self, sound_file: str | Path | None = None, start_seconds: float = 0.0) -> None:
         if sound_file is not None:
             self.set_music_source(sound_file)
-        self.music.play(loop=self.config_manager.loop_music(), start_seconds=start_seconds)
+        self.music.play(start_seconds=start_seconds)
+
+    def music_finished(self) -> bool:
+        return self.music.consume_finished()
 
     def seek_music(self, seconds: float) -> None:
         self.music.seek(seconds)
@@ -1170,17 +1132,19 @@ class soundMotor:
     def toggle_music_pause(self) -> None:
         self.music.toggle_pause()
 
-    def stop_sfx(self) -> None:
-        self.sfx.stop()
-
-    def pause_sfx(self) -> None:
-        self.sfx.pause()
-
-    def resume_sfx(self) -> None:
-        self.sfx.resume()
+    def stop_sfx(self, sound_file: str | Path | None = None) -> None:
+        self.sfx.stop(sound_file)
 
     def toggle_sfx_pause(self) -> None:
         self.sfx.toggle_pause()
+
+    def forget_file(self, sound_file: str | Path) -> None:
+        """Antes de borrar un archivo: dejar de usarlo en cualquier reproductor."""
+        path = Path(sound_file)
+        self.sfx.forget(path)
+        if self.music_source == path:
+            self.music.stop()
+            self.set_music_source(None)
 
     def get_music_state(self) -> dict[str, Any]:
         return self.music.get_state()

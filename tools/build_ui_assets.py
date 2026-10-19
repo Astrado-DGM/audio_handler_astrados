@@ -233,6 +233,17 @@ def build_images(src: Path, percent: int) -> None:
         save(brightness(face, 1.12), out, f"orb_{action}_hover")
         save(brightness(face, 0.85), out, f"orb_{action}_pressed")
 
+    # Loop de efectos (celeste apagado / morado encendido) y eliminar (rojo, mas chico).
+    for action, icon_name, source, diameter, icon_size in (
+        ("loop", "arrow-path", cyan_orb, 38, 17),
+        ("loop_on", "arrow-path", purple_orb, 38, 17),
+        ("delete", "trash", red_orb, 30, 14),
+    ):
+        face = overlay_center(orb(source, px(diameter)), svg_icon(src, icon_name, px(icon_size), ICON_WHITE))
+        save(face, out, f"orb_{action}")
+        save(brightness(face, 1.12), out, f"orb_{action}_hover")
+        save(brightness(face, 0.85), out, f"orb_{action}_pressed")
+
     # Casillas: burbuja vacia / orbe azul con check.
     def with_gap(image: Image.Image) -> Image.Image:
         # Margen transparente a la derecha: separa la casilla de su texto.
