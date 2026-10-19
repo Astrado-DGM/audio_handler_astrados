@@ -1,0 +1,49 @@
+<!--
+  Instalador MSI de Astrados Audio Handler (WiX Toolset v5).
+  Lo compila tools/build_release.sh; no hace falta editarlo por version:
+    wix build -arch x64 -d Version=1.0.0 -d SourceDir=<carpeta PyInstaller> -d IconFile=visual\app.ico ...
+  El UpgradeCode no debe cambiar nunca: es lo que permite actualizar sobre una version anterior.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="Astrados Audio Handler"
+      Manufacturer="Astrados"
+      Version="$(Version)"
+      UpgradeCode="304A01BD-48E9-4F8F-9A09-E979D30B7852"
+      Scope="perMachine"
+      Compressed="yes"
+      Language="1034">
+
+    <SummaryInformation Description="Mezclador de musica, SFX y microfono para Discord" />
+    <MajorUpgrade DowngradeErrorMessage="Ya hay instalada una version mas nueva de Astrados Audio Handler." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="AppIcon" SourceFile="$(IconFile)" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/Astrado-DGM/audio_handler_astrados" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Astrados Audio Handler" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="AppMenuFolder" Name="Astrados Audio Handler" />
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="Astrados Audio Handler" Level="1">
+      <!-- Toda la carpeta generada por PyInstaller (exe + _internal). -->
+      <Files Directory="INSTALLFOLDER" Include="$(SourceDir)\**" />
+
+      <Component Id="StartMenuShortcut" Directory="AppMenuFolder">
+        <Shortcut
+            Id="AppShortcut"
+            Name="Astrados Audio Handler"
+            Description="Musica, SFX y microfono para Discord"
+            Target="[INSTALLFOLDER]AstradosAudioHandler.exe"
+            WorkingDirectory="INSTALLFOLDER"
+            Icon="AppIcon" />
+        <RemoveFolder Id="RemoveAppMenuFolder" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="Software\Astrados\AstradosAudioHandler" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </Feature>
+  </Package>
+</Wix>

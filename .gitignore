@@ -54,6 +54,8 @@ Thumbs.db
 *.flac
 *.m4a
 *.aac
+# Sonidos de interfaz generados por tools/build_ui_assets.py (si se versionan)
+!visual/sounds/*.wav
 
 # Logs
 *.log

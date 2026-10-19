@@ -6,6 +6,32 @@ from pathlib import Path
 from typing import Any
 
 
+# Ctrl+Alt+Shift casi no lo usan otras apps; los hotkeys son globales, asi que
+# combinaciones como Ctrl+S o Ctrl+R le robarian el atajo a todo Windows.
+DEFAULT_HOTKEYS: dict[str, str] = {
+    "refresh_library": "Ctrl+Alt+Shift+R",
+    "toggle_mic": "Ctrl+Alt+Shift+M",
+    "play_music": "Ctrl+Alt+Shift+P",
+    "stop_music": "Ctrl+Alt+Shift+O",
+    "pause_music": "Ctrl+Alt+Shift+I",
+    "play_sfx": "Ctrl+Alt+Shift+E",
+    "stop_sfx": "Ctrl+Alt+Shift+W",
+    "pause_sfx": "Ctrl+Alt+Shift+Q",
+    "next_music": "Ctrl+Alt+Shift+N",
+    "next_sfx": "Ctrl+Alt+Shift+D",
+    "save_settings": "Ctrl+Alt+Shift+S",
+}
+
+# Defaults antiguos que chocan con atajos universales; se migran al cargar.
+LEGACY_CONFLICTING_HOTKEYS: dict[str, str] = {
+    "refresh_library": "Ctrl+R",
+    "toggle_mic": "Ctrl+M",
+    "pause_music": "Ctrl+P",
+    "play_sfx": "Ctrl+E",
+    "save_settings": "Ctrl+S",
+}
+
+
 class configHandler:
     def __init__(self, config_dir: Path | str | None = None) -> None:
         base_dir = Path(config_dir) if config_dir is not None else Path(__file__).resolve().parents[1] / "data" / "config"
@@ -30,17 +56,23 @@ class configHandler:
             "max_channels": 8,
             "sample_rate": 44100,
             "buffer_size": 1024,
-            "hotkeys": {
-                "refresh_library": "Ctrl+R",
-                "toggle_mic": "Ctrl+M",
-                "play_music": "Ctrl+Shift+M",
-                "stop_music": "Ctrl+Alt+M",
-                "pause_music": "Ctrl+P",
-                "play_sfx": "Ctrl+E",
-                "stop_sfx": "Ctrl+Alt+E",
-                "pause_sfx": "Ctrl+Shift+E",
-                "save_settings": "Ctrl+S",
-            },
+            "mic_noise_suppression": False,
+            "mic_suppression_strength": 0.6,
+            "mic_noise_gate": False,
+            "mic_gate_threshold_db": -45.0,
+            "mic_highpass": True,
+            "mic_ducking": True,
+            "mic_ducking_level": 0.4,
+            "skip_cable_check": False,
+            "ui_sounds": True,
+            # playlist | shuffle | repeat_one | once
+            "music_mode": "playlist",
+            # Carpeta elegida en cada pestaña ("Todas", "General" o la ruta relativa).
+            "music_folder": "Todas",
+            "sfx_folder": "Todas",
+            # Atajo propio de cada efecto: {ruta relativa dentro de sfx: "Ctrl+Alt+1"}.
+            "sfx_hotkeys": {},
+            "hotkeys": dict(DEFAULT_HOTKEYS),
         }
 
     def _clamp_float(self, value: Any) -> float:
@@ -57,6 +89,9 @@ class configHandler:
         hotkeys = dict(self.load_default_config()["hotkeys"])
         if isinstance(merged.get("hotkeys"), dict):
             hotkeys.update(merged["hotkeys"])
+        for action, legacy_spec in LEGACY_CONFLICTING_HOTKEYS.items():
+            if str(hotkeys.get(action, "")).replace(" ", "").casefold() == legacy_spec.casefold():
+                hotkeys[action] = DEFAULT_HOTKEYS[action]
         merged["hotkeys"] = hotkeys
 
         merged["volume_sfx"] = self._clamp_float(merged.get("volume_sfx", 1.0))
@@ -73,6 +108,26 @@ class configHandler:
         merged["max_channels"] = int(merged.get("max_channels", 8))
         merged["sample_rate"] = int(merged.get("sample_rate", 44100))
         merged["buffer_size"] = int(merged.get("buffer_size", 1024))
+        merged["mic_noise_suppression"] = bool(merged.get("mic_noise_suppression", False))
+        merged["mic_suppression_strength"] = self._clamp_float(merged.get("mic_suppression_strength", 0.6))
+        merged["mic_noise_gate"] = bool(merged.get("mic_noise_gate", False))
+        try:
+            merged["mic_gate_threshold_db"] = max(-90.0, min(0.0, float(merged.get("mic_gate_threshold_db", -45.0))))
+        except (TypeError, ValueError):
+            merged["mic_gate_threshold_db"] = -45.0
+        merged["mic_highpass"] = bool(merged.get("mic_highpass", True))
+        merged["mic_ducking"] = bool(merged.get("mic_ducking", True))
+        merged["mic_ducking_level"] = self._clamp_float(merged.get("mic_ducking_level", 0.4))
+        merged["skip_cable_check"] = bool(merged.get("skip_cable_check", False))
+        merged["ui_sounds"] = bool(merged.get("ui_sounds", True))
+        if merged.get("music_mode") not in ("playlist", "shuffle", "repeat_one", "once"):
+            merged["music_mode"] = "playlist"
+        merged["music_folder"] = str(merged.get("music_folder") or "Todas")
+        merged["sfx_folder"] = str(merged.get("sfx_folder") or "Todas")
+        sfx_hotkeys = merged.get("sfx_hotkeys")
+        merged["sfx_hotkeys"] = {
+            str(key): str(spec) for key, spec in (sfx_hotkeys.items() if isinstance(sfx_hotkeys, dict) else []) if str(spec).strip()
+        }
         return merged
 
     def readConfig(self, config_path: Path | str | None = None) -> dict[str, Any]:
